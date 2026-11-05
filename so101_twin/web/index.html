@@ -58,6 +58,34 @@
   body.aligning #legend::after { content: "ALIGN MODE — motors locked"; display: block; color: var(--target); font-weight: 700; margin-top: 4px; }
   .note { color: var(--dim); font-size: 11.5px; margin-top: 8px; }
 
+  #replayBar { background: var(--panel2); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+  .rhead { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+  .rhead span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .track { height: 6px; background: var(--track); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .fill { height: 100%; width: 0; background: var(--accent); transition: width .1s linear; }
+  body.replaying .joint input[type=range] { opacity: .35; pointer-events: none; }
+  body.replaying #legend::after { content: "REPLAYING — STOP or Space to take control"; display: block; color: var(--accent); font-weight: 700; margin-top: 4px; }
+
+  #picker { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; z-index: 10; padding: 16px; }
+  #picker[hidden] { display: none; }
+  .pbox { background: var(--panel); border: 1px solid #2c2e37; border-radius: 10px; width: min(460px, 100%);
+    max-height: 80vh; display: flex; flex-direction: column; }
+  .pbox h3 { margin: 0; padding: 12px 14px; font-size: 14px; border-bottom: 1px solid #2c2e37; }
+  #plist { overflow-y: auto; padding: 6px; }
+  .pitem { display: grid; grid-template-columns: 22px 1fr auto; gap: 8px; align-items: center; padding: 7px 8px;
+    border-radius: 7px; cursor: pointer; }
+  .pitem:hover { background: var(--panel2); }
+  .pitem.sel { background: #2a3550; }
+  .pnum { width: 20px; height: 20px; border-radius: 50%; border: 1px solid #5a5d6a; display: grid; place-items: center;
+    font-size: 11px; font-weight: 700; }
+  .pitem.sel .pnum { background: var(--accent); border-color: var(--accent); color: #06121f; }
+  .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pmeta { color: var(--dim); font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
+  .pfoot { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid #2c2e37; align-items: center; }
+  .pfoot .hint { color: var(--dim); font-size: 11.5px; flex: 1; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 700; }
+  button:disabled { opacity: .45; cursor: default; }
+
   #status { margin-top: 14px; color: var(--dim); font-size: 12px; min-height: 18px; word-break: break-word; }
   #status.err { color: var(--danger); }
 
@@ -109,6 +137,8 @@
       <button class="stop" id="stop" title="Freeze the target where the arm is now (Space)">STOP</button>
       <button id="home" title="Return to the pose the arm had when the server started">Start pose</button>
     </div>
+    <button id="arBtn" style="width:100%;margin-top:8px" disabled>Checking AR support…</button>
+    <div class="note" id="arNote"></div>
 
     <h2>Max speed</h2>
     <div class="row">
@@ -119,12 +149,21 @@
     <h2>Joints <span style="text-transform:none;letter-spacing:0;font-weight:400">— actual / <span style="color:var(--target)">target</span></span></h2>
     <div id="joints"></div>
 
-    <h2>Record</h2>
+    <h2>Motions</h2>
     <div class="row">
-      <input type="text" id="fname" value="recording.jsonl" spellcheck="false">
+      <input type="text" id="fname" value="" placeholder="name (blank = timestamp)" spellcheck="false">
       <button class="rec" id="rec">Record</button>
     </div>
-    <div class="note">Same JSON-lines format as teleop_and_record.py, saved next to the server.</div>
+    <div class="row" style="margin-top:6px">
+      <button id="replayBtn" style="flex:1">Replay…</button>
+    </div>
+    <div id="replayBar" hidden>
+      <div class="rhead"><span id="replayFile"></span><span id="replayPct"></span></div>
+      <div class="track"><div class="fill" id="replayFill"></div></div>
+      <button id="replayStop" style="width:100%;margin-top:6px">Stop replay</button>
+    </div>
+    <div class="note">Saved to so101_twin/recorded_motions/ (same JSON-lines format as teleop_and_record.py).
+      Replay runs at most at the max speed above.</div>
 
     <h2>Twin ↔ real arm alignment</h2>
     <button id="alignBtn" style="width:100%">Align twin to real arm…</button>
@@ -142,6 +181,18 @@
 
     <div id="status"></div>
   </aside>
+</div>
+
+<div id="picker" hidden>
+  <div class="pbox" role="dialog" aria-label="Choose recordings to replay">
+    <h3>Replay from recorded_motions/</h3>
+    <div id="plist"></div>
+    <div class="pfoot">
+      <span class="hint" id="phint">Click files to select. They play in the order you click.</span>
+      <button id="pcancel">Cancel</button>
+      <button class="primary" id="pplay" disabled>Play</button>
+    </div>
+  </div>
 </div>
 
 <script type="module">
@@ -167,6 +218,7 @@ let dragging = null;                  // joint name being dragged
 let calib = Object.fromEntries(JOINTS.map(j => [j, { sign: 1, offset: 0 }]));
 let calibBackup = null;
 let aligning = false;
+let replaying = false;                // server is playing a recording: manual input is ignored
 
 // ---------------------------------------------------------------- api
 async function api(path, body) {
@@ -205,8 +257,10 @@ function clampDeg(j, v) { const [lo, hi] = cfg.limits[j]; return Math.min(Math.m
 
 // ---------------------------------------------------------------- three.js scene
 const view = $('view');
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });   // alpha: passthrough shows through in AR
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');                              // y = 0 is the real floor in AR
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 view.prepend(renderer.domElement);
@@ -222,22 +276,28 @@ orbit.enableDamping = true;
 orbit.minDistance = 0.15; orbit.maxDistance = 2;
 orbit.update();
 
+// Everything that belongs to the robot (both arms, its light, its shadow catcher, the grid) lives in
+// twinRoot, so AR can place the whole twin in the room by moving one object.
+const twinRoot = new THREE.Group();
+scene.add(twinRoot);
+
 scene.add(new THREE.HemisphereLight(0xffffff, 0x2a2b33, 1.6));
 const sun = new THREE.DirectionalLight(0xffffff, 2.2);
 sun.position.set(0.5, 1.0, 0.4);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 Object.assign(sun.shadow.camera, { left: -0.5, right: 0.5, top: 0.5, bottom: -0.5, near: 0.1, far: 3 });
-scene.add(sun);
+twinRoot.add(sun, sun.target);               // light + shadow box follow the twin when it is moved
 
 const floor = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), new THREE.ShadowMaterial({ opacity: 0.35 }));
 floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true;
-scene.add(floor);
+twinRoot.add(floor);                         // ShadowMaterial: in AR this draws only the shadow, on the real table
 const grid = new THREE.GridHelper(1.2, 24, 0x3a3c46, 0x26282f);
 grid.position.y = 0.0005;
-scene.add(grid);
+twinRoot.add(grid);
 
 function resize() {
+  if (renderer.xr.isPresenting) return;     // the headset owns the canvas size while in AR
   const w = view.clientWidth, h = view.clientHeight;
   renderer.setSize(w, h, false);
   renderer.domElement.style.width = w + 'px'; renderer.domElement.style.height = h + 'px';
@@ -270,13 +330,13 @@ function setupRobots(robot) {
   actualBot = robot;
   actualBot.rotation.x = -Math.PI / 2;           // URDF is Z-up, three.js is Y-up
   actualBot.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-  scene.add(actualBot);
+  twinRoot.add(actualBot);
 
   ghostBot = actualBot.clone(true);
   ghostBot.traverse(o => {
     if (o.isMesh) { o.material = ghostMat; o.castShadow = false; o.receiveShadow = false; o.renderOrder = 2; }
   });
-  scene.add(ghostBot);
+  twinRoot.add(ghostBot);
 
   jointMap(actualBot, actualJ);
   jointMap(ghostBot, ghostJ);
@@ -288,7 +348,7 @@ function setupRobots(robot) {
 
   $('loading').remove();
   setupDrag();
-  window.twin = { THREE, camera, orbit, actualJ, ghostJ, target, view };   // handy in the devtools console
+  window.twin = { THREE, camera, orbit, actualJ, ghostJ, target, view, twinRoot, renderer, scene };   // handy in the devtools console
   maybeStart();
 }
 
@@ -304,6 +364,7 @@ function setupDrag() {
   drag.updateJoint = (joint, angle) => {
     if (!cfg) return;
     const j = joint.urdfName;
+    if (replaying) return;               // the recording owns the arm until STOP
     if (aligning) {                      // move the twin, not the motor: solve for the offset
       if (j === 'gripper' || !state) return;
       setOffset(j, angle / D2R - calib[j].sign * state.actual[j]);
@@ -346,7 +407,7 @@ function setupDrag() {
 
 // ---------------------------------------------------------------- target -> server
 function setTarget(j, deg) {
-  if (aligning) return;                // motors are locked while aligning
+  if (aligning || replaying) return;   // motors are locked while aligning / replaying
   target[j] = deg;
   localEditUntil[j] = performance.now() + 400;
   pending[j] = deg;
@@ -362,7 +423,10 @@ async function flush() {
   if (!Object.keys(body).length) return;
   for (const k in body) delete pending[k];
   inFlight = true;
-  try { await api('/api/target', body); } catch { Object.assign(pending, body); }
+  try {
+    const r = await api('/api/target', body);
+    if (r.status === 409) say(r.data.msg, true);
+  } catch { Object.assign(pending, body); }
   inFlight = false;
   if (Object.keys(pending).length) scheduleFlush();
 }
@@ -425,6 +489,12 @@ function buildPanel() {
   $('stop').onclick = doStop;
   $('home').onclick = async () => { const r = await api('/api/go_start', {}); say(r.data.msg || ''); forceSync(); };
   $('rec').onclick = toggleRecord;
+  $('replayBtn').onclick = openPicker;
+  $('replayStop').onclick = doStop;
+  $('pcancel').onclick = closePicker;
+  $('pplay').onclick = playSelected;
+  $('picker').addEventListener('click', e => { if (e.target.id === 'picker') closePicker(); });
+  window.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('picker').hidden) closePicker(); });
   window.addEventListener('keydown', e => {
     if (e.code === 'Space' && !(e.target instanceof HTMLInputElement && e.target.type === 'text')) {
       e.preventDefault(); doStop();
@@ -442,8 +512,85 @@ async function toggleRecord() {
   if (state?.recording) { const r = await api('/api/record/stop', {}); say(r.data.msg); return; }
   const file = $('fname').value.trim();
   let r = await api('/api/record/start', { file });
-  if (r.status === 409 && confirm(`${file} exists. Overwrite it?`)) r = await api('/api/record/start', { file, overwrite: true });
+  if (r.status === 409 && confirm(`${r.data.file} already exists in recorded_motions. Overwrite it?`))
+    r = await api('/api/record/start', { file, overwrite: true });
   if (r.status !== 409) say(r.data.msg, !r.ok);
+}
+
+// ---------------------------------------------------------------- replay picker
+let pickOrder = [];                      // selected file names, in click order
+function fmtDur(s) { return s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${s.toFixed(1)} s`; }
+function fmtDate(t) {
+  const d = new Date(t * 1000);
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) + ' ' +
+         d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+async function openPicker() {
+  if (state?.recording) { say('Stop recording before replaying.', true); return; }
+  pickOrder = [];
+  const list = $('plist');
+  list.textContent = 'Loading…';
+  $('picker').hidden = false;
+  let files = [];
+  try { files = (await api('/api/recordings')).data.files || []; }
+  catch { list.textContent = 'Could not reach the server.'; return; }
+  list.textContent = '';
+  if (!files.length) {
+    list.innerHTML = '<div class="note" style="padding:10px">No recordings yet. Press Record, move the arm, then stop recording.</div>';
+  }
+  for (const f of files) {
+    const row = document.createElement('div');
+    row.className = 'pitem'; row.dataset.name = f.name;
+    row.innerHTML = `<span class="pnum"></span><span class="pname"></span>
+      <span class="pmeta">${fmtDur(f.duration)} · ${f.frames} frames<br>${fmtDate(f.mtime)}</span>`;
+    row.querySelector('.pname').textContent = f.name;   // file names are user text: never as HTML
+    row.title = f.name;
+    row.onclick = () => {
+      const k = pickOrder.indexOf(f.name);
+      if (k >= 0) pickOrder.splice(k, 1); else pickOrder.push(f.name);
+      renderPicks();
+    };
+    list.append(row);
+  }
+  renderPicks();
+}
+function renderPicks() {
+  for (const row of $('plist').querySelectorAll('.pitem')) {
+    const k = pickOrder.indexOf(row.dataset.name);
+    row.classList.toggle('sel', k >= 0);
+    row.querySelector('.pnum').textContent = k >= 0 ? k + 1 : '';
+  }
+  $('pplay').disabled = !pickOrder.length;
+  $('pplay').textContent = pickOrder.length > 1 ? `Play ${pickOrder.length}` : 'Play';
+}
+function closePicker() { $('picker').hidden = true; }
+async function playSelected() {
+  if (!pickOrder.length) return;
+  for (const k in pending) delete pending[k];          // drop half-sent drags before the replay takes over
+  const r = await api('/api/replay/start', { files: pickOrder });
+  say(r.data.msg, !r.ok);
+  if (r.ok) closePicker();
+}
+let lastReplayMsg = '';
+function updateReplayUI(rp) {
+  const was = replaying;
+  replaying = !!rp?.active;
+  document.body.classList.toggle('replaying', replaying);
+  $('replayBar').hidden = !replaying;
+  $('replayBtn').disabled = replaying || !!state?.recording;
+  $('rec').disabled = replaying;
+  if (replaying) {
+    if (dragging && drag) drag.setGrabbed(false);
+    const n = rp.count > 1 ? ` (${rp.index + 1}/${rp.count})` : '';
+    $('replayFile').textContent = rp.file + n;
+    $('replayPct').textContent = rp.phase === 'approach' ? 'moving to start…'
+      : `${rp.t.toFixed(1)} / ${rp.duration.toFixed(1)} s`;
+    $('replayFill').style.width = (rp.progress * 100).toFixed(1) + '%';
+  } else if (was) {
+    forceSync();
+  }
+  if (rp && !rp.active && rp.msg && rp.msg !== lastReplayMsg) { say(rp.msg); }
+  lastReplayMsg = rp?.msg || '';
 }
 
 // ---------------------------------------------------------------- twin alignment
@@ -507,6 +654,7 @@ async function poll() {
       $('a-' + j).textContent = state.actual[j].toFixed(1) + UNIT(j);
       $('t-' + j).textContent = target[j].toFixed(1) + UNIT(j);
     }
+    updateReplayUI(state.replay);
     const rb = $('rec');
     rb.classList.toggle('on', state.recording);
     rb.textContent = state.recording ? 'Stop recording' : 'Record';
@@ -529,7 +677,7 @@ async function maybeStart() {
   try {
     const r = await api('/api/config');
     cfg = r.data;
-    for (const j of JOINTS) target[j] = cfg.start_pose[j];
+    for (const j of JOINTS) { target[j] = cfg.start_pose[j]; localEditUntil[j] = 0; }   // 0, not undefined: `now > undefined` is false
     for (const j of JOINTS) {
       const c = cfg.twin_calib?.[j];
       if (c) calib[j] = { sign: c.sign < 0 ? -1 : 1, offset: +c.offset || 0 };
@@ -542,8 +690,1276 @@ async function maybeStart() {
   } catch { say('Could not reach twin_server.py — is it running?', true); }
 })();
 
+// ---------------------------------------------------------------- AR (WebXR on Quest 3, passthrough)
+// Phase 0: the live twin floats in your room; pull a trigger to drop it near the real arm.
+// Phase 1: align it exactly. Touch two corners of the REAL base plate (2-point calibration), then
+//          fine-tune with the thumbsticks. The result is saved as a WebXR anchor, so the next session
+//          finds the robot again without recalibrating.
+//
+// Controller map in AR (shown in the floating help panel too):
+//   Y .............. open / close the AR menu (replay, hologram, labels, realign, forget)
+//   B .............. hologram on / off (labels stay)
+//   left stick click  motor labels: all -> moving only -> off
+//   trigger ........ point at a menu button and pull to press it
+//   A .............. not aligned yet: start aligning | while aligning: DONE (save + lock)
+//   X .............. while aligning: CANCEL (go back to the saved alignment)
+//   while aligning . grip at the glowing elbow motor = grab it; grip + sticks = fine-tune;
+//                    right stick click = 2-corner method (trigger captures a corner)
+//
+// Hand-tracking map (no controllers needed):
+//   wrist bar ...... buttons above your LEFT wrist, poked with the right index finger. Contents change:
+//                    normal: Menu | Hologram | Labels | Help   (Align first if not aligned yet)
+//                    replay running: STOP | Menu | Hologram | Labels
+//                    aligning: Done | Cancel | Tune | Hologram
+//   AR menu ........ poke its buttons, or point a hand/controller ray at them and pinch/pull the trigger
+//   aligning ....... pinch the glowing motor, move it onto the REAL one, twist your wrist, let go.
+//                    Tune on: pinch-drag right hand = slide, left hand = turn (1/3 scale)
+//
+// SAFEGUARD: once aligned, the alignment is LOCKED. Only Menu > Realign (tap twice to confirm) unlocks
+// it, and realigning is an edit: Done saves it, Cancel restores the previous alignment exactly (the old
+// anchor is kept alive until Done).
+//
+// Everything here only moves the DRAWING. Nothing in this block sends anything to the motors.
+
+const ROBOT_FORWARD_YAW = 0;   // the URDF arm reaches along its +X axis at zero angles
+// Reference points on the real robot: the two front corners of the base plate, where it meets the table.
+// URDF base frame in metres (from base_so101_v2.stl). In three.js (Y-up) a URDF point (x, y, z) is (x, z, -y).
+const CAL_PTS_URDF = [[0.0643, 0.0333, -0.0024], [0.0643, -0.0333, -0.0024]];
+const CAL_PTS = CAL_PTS_URDF.map(([x, y, z]) => new THREE.Vector3(x, z, -y));
+const CAL_SPAN = CAL_PTS[0].distanceTo(CAL_PTS[1]);          // 66.6 mm between the two corners
+const CAL_COLORS = ['#3ecf8e', '#e05be0'];
+const ANCHOR_KEY = 'so101-twin-anchor';
+const TUNE_TURN = 20 * D2R, TUNE_MOVE = 0.03;                // full stick: 20 deg/s, 3 cm/s
+const LOOKS = ['solid', 'see-through', 'hidden'];
+
+const ar = {
+  mode: 'free',          // 'free' | 'calib'
+  aligned: false,        // twin has been put on the real robot (by calibration or a restored anchor)
+  captured: [],          // world points captured during calibration
+  anchor: null,          // XRAnchor holding the alignment
+  anchorPending: false,  // create an anchor on the next frame (needs an XRFrame)
+  restoring: false, restoreUntil: 0,
+  tuning: false,         // grip held and sticks moved: anchor-following paused
+  look: 0, hud: true,
+  quality: '', note: '',
+  buttons: new Map(),
+  placeOnNextFrame: false,
+  tuneMode: false,       // hands: pinch-drag moves the twin
+  drag: null,            // active pinch-drag while tuning
+  dwell: { pos: null, t0: 0, sum: new THREE.Vector3(), n: 0, armed: true, last: null },
+  poke: { armed: false, until: 0 },   // wrist-menu button state: armed = fingertip is in front of the bar
+  anchorGen: 0, restoreGen: 0,        // generation counters: late async results for an older pose are dropped
+  persisted: false,                   // the current alignment is saved for the next session
+  editing: false,                     // aligning (first time or Realign): changes are not saved until Done
+  editBackup: null,                   // pose + anchor to go back to on Cancel
+  holo: true,                         // hologram on/off (labels unaffected)
+  menuOpen: false,
+  confirm: { id: null, until: 0 },    // "tap again to confirm" for Realign / Forget
+  rec: { files: [], pick: [], page: 0, loaded: false },
+};
+try { ar.holo = localStorage.getItem('so101-twin-holo') !== '0'; } catch {}
+try { ar.hud = localStorage.getItem('so101-twin-help') !== '0'; } catch {}
+const TOAST_MS = 4000;                     // help panel hidden: a new message still shows this long
+const DWELL_MS = 1500, DWELL_TOL = 0.006;   // hold the fingertip within 6 mm for 1.5 s
+const HAND_SCALE = 1 / 3;                    // pinch-drag moves the twin a third as far as your hand
+const HAND_TURN = 2.0;                       // rad per metre of (scaled) sideways motion: 10 cm of hand = ~3.8 deg
+const GRAB_REACH = 0.12;                     // pinch/grip within 12 cm of the glowing motor to grab it
+
+// ---- align by one motor (the elbow-flex motor by default, see ALIGN_MOTOR) ----------------
+// The twin is drawn from the LIVE joint angles, so that motor sits exactly where the real one does
+// relative to the base. Put the hologram's motor on the real motor (same place, same facing)
+// and the base, and therefore the whole arm, is aligned: still 4 unknowns (x, y, z, yaw), matched by eye
+// on one big part instead of touched at two small corners.
+// Which motor to align by. Each STS3215 is the <visual> of the link it is bolted to; `joint` is the joint
+// whose PARENT link holds it, `xyz` is that <visual>'s origin in the URDF.
+//   shoulder-lift motor: { joint: 'shoulder_lift', xyz: [-0.0303992, 0.000422241, -0.0417] }  (on shoulder_link)
+//   elbow-flex motor:    { joint: 'elbow_flex',    xyz: [-0.11257, -0.0155, 0.0187] }        (on upper_arm_link)
+const ALIGN_MOTOR = { joint: 'elbow_flex', name: 'elbow-flex', xyz: [-0.11257, -0.0155, 0.0187] };
+const LIFT_MOTOR_XYZ = new THREE.Vector3(...ALIGN_MOTOR.xyz);
+const liftMat = new THREE.MeshStandardMaterial({ color: 0x00e5ff, emissive: 0x006b80, roughness: 0.4,
+  transparent: true, opacity: 0.7, depthWrite: false });
+let liftMotor = null;
+function findLiftMotor() {
+  if (liftMotor || !actualJ[ALIGN_MOTOR.joint]) return liftMotor;
+  const link = actualJ[ALIGN_MOTOR.joint].parent;        // the link the motor is bolted to
+  let best = null, bestD = Infinity;
+  for (const c of link.children) {
+    if (!c.isURDFVisual) continue;
+    const d = c.position.distanceTo(LIFT_MOTOR_XYZ);
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  if (!best || bestD > 0.002) { console.warn(`[AR] ${ALIGN_MOTOR.name} motor mesh not found`); return null; }
+  const meshes = [];
+  best.traverse(o => { if (o.isMesh) meshes.push({ mesh: o, mat: o.material }); });
+  liftMotor = { visual: best, meshes };
+  return liftMotor;
+}
+const _box = new THREE.Box3();
+function liftCenter(out = new THREE.Vector3()) {
+  const m = findLiftMotor();
+  if (!m) return twinRoot.getWorldPosition(out);
+  return _box.setFromObject(m.visual).getCenter(out);
+}
+function setLiftGlow(on) {
+  const m = findLiftMotor();
+  if (!m) return;
+  for (const e of m.meshes) { e.mesh.material = on ? liftMat : e.mat; e.mesh.renderOrder = on ? 6 : 0; }
+}
+const _e = new THREE.Euler();
+function rootYaw() { return _e.setFromQuaternion(twinRoot.quaternion, 'YXZ').y; }
+function wrapPi(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+// Turn the twin by dYaw about a vertical axis through `pivot` (world), keeping that point fixed.
+function turnAbout(pivot, dYaw, root0 = twinRoot.position.clone(), yaw0 = rootYaw()) {
+  const q = new THREE.Quaternion().setFromAxisAngle(_up, dYaw);
+  twinRoot.position.copy(root0.clone().sub(pivot).applyQuaternion(q).add(pivot));
+  twinRoot.rotation.set(0, yaw0 + dYaw, 0);
+}
+function headingOf(obj) {      // horizontal heading of an object's -Z (fingers / controller pointing); null if vertical
+  const f = new THREE.Vector3(0, 0, -1).applyQuaternion(obj.getWorldQuaternion(new THREE.Quaternion()));
+  if (Math.hypot(f.x, f.z) < 0.3) return null;
+  return Math.atan2(-f.z, f.x);
+}
+function grabSourcePose(src) {
+  if (src.hand) {
+    const p = pinchPos(src.hand), w = joint(src.hand, 'wrist');
+    return p && w ? { p, yaw: headingOf(w) } : null;
+  }
+  return { p: src.ctrl.getWorldPosition(new THREE.Vector3()), yaw: headingOf(src.ctrl) };
+}
+function startGrabAlign() {
+  if (ar.mode === 'calib') cancelCalibration('');
+  cancelRestore();
+  clearMotorGlows();
+  ar.mode = 'grab'; ar.tuneMode = false; ar.drag = null;
+  applyLook();                                              // see-through while aligning: the real motor shows behind
+  setLiftGlow(true);
+  ar.note = '';
+}
+function endGrabAlign(msg = 'Done.') {
+  ar.mode = 'free'; ar.drag = null;
+  setLiftGlow(false);
+  applyLook();
+  ar.note = msg;
+}
+function beginGrab(src) {
+  const sp = grabSourcePose(src);
+  if (!sp) return false;
+  const c = liftCenter();
+  if (sp.p.distanceTo(c) > GRAB_REACH) { ar.note = 'Reach closer: pinch/grip right at the glowing motor.'; return false; }
+  ar.drag = { type: 'grab', src, p0: sp.p.clone(), yaw0: sp.yaw, c0: c.clone(),
+              root0: twinRoot.position.clone(), rootYaw0: rootYaw() };
+  ar.tuning = true; dropAnchor();
+  return true;
+}
+function endGrab() {
+  ar.drag = null;
+  ar.aligned = true;
+  ar.quality = `matched on the ${ALIGN_MOTOR.name} motor`;
+}
+const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _f = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const store = {
+  get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+  del: k => { try { localStorage.removeItem(k); } catch {} },
+};
+
+// ---- text panels drawn on a canvas (used for the help panel and the point labels) -------------
+function makeTextPanel(widthM, heightM, pxPerM = 1800) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(widthM * pxPerM); canvas.height = Math.round(heightM * pxPerM);
+  const ctx = canvas.getContext('2d');
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(widthM, heightM),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  mesh.renderOrder = 20;
+  let last = '';
+  // lines: array of strings or {t: text, c: colour, b: bold}
+  mesh.userData.draw = (lines, bg = 'rgba(22,23,28,0.85)') => {
+    const key = bg + JSON.stringify(lines);
+    if (key === last) return;
+    last = key;
+    const W = canvas.width, H = canvas.height, pad = H * 0.07;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = bg;
+    ctx.beginPath(); ctx.roundRect(0, 0, W, H, H * 0.08); ctx.fill();
+    const n = Math.max(lines.length, 1), lh = (H - 2 * pad) / n;
+    ctx.textBaseline = 'middle';
+    lines.forEach((ln, i) => {
+      const o = typeof ln === 'string' ? { t: ln } : ln;
+      ctx.font = `${o.b ? 700 : 500} ${Math.round(lh * 0.62)}px system-ui, sans-serif`;
+      ctx.fillStyle = o.c || '#e8e8e8';
+      ctx.textAlign = o.center ? 'center' : 'left';
+      ctx.fillText(o.t, o.center ? W / 2 : pad, pad + lh * (i + 0.5), W - 2 * pad);
+    });
+    tex.needsUpdate = true;
+  };
+  return mesh;
+}
+
+// Help panel: floats below your line of sight and lazily follows your head.
+const hud = makeTextPanel(0.34, 0.15);
+hud.visible = false;
+scene.add(hud);
+
+// Calibration markers on the hologram: show WHICH corner of the real base to touch.
+const calMarkers = CAL_PTS.map((p, i) => {
+  const g = new THREE.Group();
+  g.position.copy(p);
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(0.006, 20, 14),
+    new THREE.MeshBasicMaterial({ color: CAL_COLORS[i], depthTest: false }));
+  ball.renderOrder = 21;
+  const label = makeTextPanel(0.028, 0.028, 2400);
+  label.userData.draw([{ t: String(i + 1), b: true, center: true }], CAL_COLORS[i]);
+  label.position.set(0, 0.03, 0);
+  g.add(ball, label);
+  g.userData.label = label;
+  g.visible = false;
+  twinRoot.add(g);
+  return g;
+});
+
+// ---- placing / solving --------------------------------------------------------------------
+function yawFacing(dir) {      // yaw about +Y that turns the arm's +X onto this horizontal direction
+  return Math.atan2(-dir.z, dir.x) + ROBOT_FORWARD_YAW;
+}
+function placeTwinAt(obj, aheadM = 0, belowM = 0) {
+  obj.updateMatrixWorld(true);
+  obj.matrixWorld.decompose(_p, _q, new THREE.Vector3());
+  _f.set(0, 0, -1).applyQuaternion(_q); _f.y = 0;
+  if (_f.lengthSq() < 1e-6) _f.set(0, 0, -1);
+  _f.normalize();
+  twinRoot.position.copy(_p).addScaledVector(_f, aheadM);
+  twinRoot.position.y -= belowM;
+  twinRoot.rotation.set(0, yawFacing(_f), 0);
+}
+
+// Two touched points -> where the base is. The base sits on a level table, so its pose has only four
+// unknowns (x, y, z, yaw); two points give six numbers, and the spare two are a free accuracy check:
+// the touched corners must be 66.6 mm apart and at the same height.
+function solveTwoPoints(w1, w2) {
+  const heading = v => Math.atan2(-v.z, v.x);
+  const vb = CAL_PTS[1].clone().sub(CAL_PTS[0]);
+  const vw = w2.clone().sub(w1);
+  const yaw = heading(vw) - heading(vb);
+  const q = new THREE.Quaternion().setFromAxisAngle(_up, yaw);
+  const baseMid = CAL_PTS[0].clone().add(CAL_PTS[1]).multiplyScalar(0.5).applyQuaternion(q);
+  const pos = w1.clone().add(w2).multiplyScalar(0.5).sub(baseMid);
+  return {
+    pos, yaw,
+    spanErrMm: (Math.hypot(vw.x, vw.z) - CAL_SPAN) * 1000,
+    heightDiffMm: (w2.y - w1.y) * 1000,
+  };
+}
+
+function dropAnchor() {          // stop following the old anchor the moment a new pose is chosen
+  if (ar.anchor) { try { ar.anchor.delete(); } catch {} }
+  ar.anchor = null;
+  ar.anchorGen++;                // any anchor still being created for an older pose is now stale
+  cancelRestore();               // what you do now beats a saved alignment still loading
+}
+function cancelRestore() {
+  if (!ar.restoring) return;
+  ar.restoring = false;
+  ar.restoreGen++;               // a restore that resolves later is ignored
+}
+// ---- edit transaction: aligning never overwrites the saved alignment until you press Done -------
+function beginEdit() {
+  if (ar.editing) return;
+  cancelRestore();
+  ar.editBackup = { pos: twinRoot.position.clone(), quat: twinRoot.quaternion.clone(), anchor: ar.anchor,
+                    aligned: ar.aligned, quality: ar.quality, persisted: ar.persisted };
+  ar.anchor = null;               // stop following while you edit; the old anchor stays alive in the backup
+  ar.editing = true;
+  ar.confirm.id = null;
+  startGrabAlign();
+}
+function finishEditModes() {
+  if (ar.mode === 'grab') endGrabAlign('');
+  if (ar.mode === 'calib') cancelCalibration('');
+  ar.tuneMode = false; ar.drag = null; ar.tuning = false;
+}
+function commitEdit() {
+  if (!ar.editing) return;
+  finishEditModes();
+  const old = ar.editBackup?.anchor;
+  if (old) { try { old.delete(); } catch {} }
+  ar.editing = false; ar.editBackup = null;
+  ar.aligned = true;
+  if (!ar.quality) ar.quality = 'aligned by hand';
+  ar.anchorPending = true;        // save this pose; makeAnchor also replaces the saved one
+  ar.note = 'Alignment saved and locked.';
+  applyLook();
+}
+function cancelEdit() {
+  if (!ar.editing) return;
+  finishEditModes();
+  const b = ar.editBackup;
+  twinRoot.position.copy(b.pos); twinRoot.quaternion.copy(b.quat);
+  ar.anchor = b.anchor; ar.aligned = b.aligned; ar.quality = b.quality; ar.persisted = b.persisted;
+  ar.editing = false; ar.editBackup = null; ar.anchorPending = false;
+  ar.note = b.aligned ? 'Cancelled: previous alignment restored.' : 'Cancelled.';
+  applyLook();
+}
+function lockedNote() { ar.note = 'Alignment is locked. Menu > Realign to change it.'; }
+
+function startCalibration() {
+  if (ar.mode === 'grab') endGrabAlign('');
+  cancelRestore();
+  ar.mode = 'calib'; ar.captured = [];
+  ar.tuneMode = false; ar.drag = null;
+  Object.assign(ar.dwell, { pos: null, n: 0, armed: true, last: null });
+  calMarkers.forEach(m => m.visible = true);
+  ar.note = '';
+}
+function cancelCalibration(msg = 'Calibration cancelled') {
+  ar.mode = 'free'; ar.captured = [];
+  calMarkers.forEach(m => m.visible = false);
+  ar.note = msg;
+}
+function capturePoint(ctrl) { capturePointAt(ctrl.getWorldPosition(new THREE.Vector3())); }
+function capturePointAt(w) {
+  ar.captured.push(w.clone());
+  calMarkers[ar.captured.length - 1].visible = false;
+  if (ar.captured.length < 2) return;
+  const r = solveTwoPoints(ar.captured[0], ar.captured[1]);
+  dropAnchor();
+  twinRoot.position.copy(r.pos);
+  twinRoot.rotation.set(0, r.yaw, 0);
+  ar.aligned = true;
+  ar.quality = `span error ${r.spanErrMm >= 0 ? '+' : ''}${r.spanErrMm.toFixed(0)} mm, height diff ${r.heightDiffMm.toFixed(0)} mm`;
+  const bad = Math.abs(r.spanErrMm) > 10 || Math.abs(r.heightDiffMm) > 10;
+  ar.note = bad ? 'Points look off (>10 mm). Click the thumbstick to redo, or fine-tune.' : 'Corners captured. A = Done (save), X = Cancel.';
+  console.log('[AR] calibrated', r);
+  ar.mode = 'free'; ar.captured = [];
+  calMarkers.forEach(m => m.visible = false);
+  ar.anchorPending = true;
+}
+
+function onSelect(ctrl) {                         // trigger pull or pinch
+  const hv = ctrl.userData.hover;                 // pointing at a menu: this press is a button press
+  if (hv) { if (hv.b) clickButton(hv.p, hv.b); return; }
+  const isHand = !!ctrl.userData.isHand;
+  if (ar.tuneMode && isHand) return;              // pinches are drags while tuning
+  if (ar.mode === 'grab') { if (!isHand) ar.note = 'Squeeze the grip at the glowing motor to grab it.'; return; }
+  if (ar.mode === 'calib') return isHand ? undefined : capturePoint(ctrl);   // hands capture by fingertip
+  if (ar.aligned && !ar.editing) return lockedNote();
+  if (!ar.editing) { dropAnchor(); placeTwinAt(ctrl); ar.note = 'Rough position set. Now Align.'; }
+}
+
+// ---- anchors: keep the alignment fixed to the room, and across sessions -------------------
+// The Quest keeps only a limited number of saved (persistent) anchors per website. This page only ever
+// needs ONE: the current alignment. So after every save, all other anchors this site stored are deleted.
+async function purgePersistentAnchors(session, keepId = null) {
+  if (!session?.deletePersistentAnchor) return 0;
+  const ids = new Set([...(session.persistentAnchors || [])]);
+  const mine = store.get(ANCHOR_KEY);
+  if (mine) ids.add(mine);
+  let n = 0;
+  for (const id of ids) {
+    if (id === keepId) continue;
+    try { await session.deletePersistentAnchor(id); n++; } catch {}
+  }
+  if (n) console.log(`[AR] deleted ${n} old saved anchor(s)`);
+  return n;
+}
+
+async function makeAnchor(frame) {
+  ar.anchorPending = false;
+  const session = renderer.xr.getSession();
+  if (!frame.createAnchor) { ar.persisted = false; ar.note = 'No anchor support: alignment kept for this session only.'; return; }
+  const gen = ++ar.anchorGen;
+  const p = twinRoot.position, q = twinRoot.quaternion;
+  let anchor;
+  try {
+    anchor = await frame.createAnchor(
+      new XRRigidTransform({ x: p.x, y: p.y, z: p.z }, { x: q.x, y: q.y, z: q.z, w: q.w }),
+      renderer.xr.getReferenceSpace());
+  } catch (e) {
+    console.warn('[AR] createAnchor failed', e);
+    ar.persisted = false;
+    ar.note = 'Could not anchor the alignment: ' + e.message;
+    return;
+  }
+  if (gen !== ar.anchorGen) { try { anchor.delete(); } catch {} return; }   // you moved it again meanwhile
+  if (ar.anchor) { try { ar.anchor.delete(); } catch {} }
+  ar.anchor = anchor;                       // from here the alignment holds for this session
+  ar.persisted = false;
+  if (!anchor.requestPersistentHandle) {
+    ar.note = 'Kept for this session (this browser cannot save anchors between sessions).';
+    return;
+  }
+  let id = null;
+  try {
+    id = await anchor.requestPersistentHandle();
+  } catch (e) {                             // e.g. "maximum number of anchors reached": clear ours, retry once
+    console.warn('[AR] persist failed, clearing old saved anchors and retrying', e);
+    await purgePersistentAnchors(session, null);
+    store.del(ANCHOR_KEY);
+    try { id = await anchor.requestPersistentHandle(); } catch (e2) {
+      console.warn('[AR] persist failed again', e2);
+      ar.note = 'Aligned for this session, but could not save it for next time: ' + e2.message;
+      return;
+    }
+  }
+  if (gen !== ar.anchorGen && ar.anchor !== anchor) return;
+  store.set(ANCHOR_KEY, id);
+  ar.persisted = true;
+  console.log('[AR] alignment saved as persistent anchor', id);
+  purgePersistentAnchors(session, id);      // keep exactly one saved alignment
+}
+function forgetAlignment() {
+  const session = renderer.xr.getSession();
+  purgePersistentAnchors(session, null).then(() => store.del(ANCHOR_KEY));   // every anchor this site saved
+  store.del(ANCHOR_KEY);
+  dropAnchor();
+  ar.aligned = false; ar.quality = ''; ar.persisted = false;
+  ar.note = 'Saved alignment forgotten. Trigger to place, A to align.';
+}
+function tryRestoreAnchor(session) {
+  const id = store.get(ANCHOR_KEY);
+  if (!id || !session.restorePersistentAnchor) { purgePersistentAnchors(session, null); return; }
+  ar.restoring = true; ar.restoreUntil = performance.now() + 6000;
+  const gen = ++ar.restoreGen;
+  session.restorePersistentAnchor(id)
+    .then(a => {
+      if (gen !== ar.restoreGen || !ar.restoring) { try { a.delete(); } catch {} return; }   // you already moved on
+      ar.anchor = a; ar.note = 'Restoring saved alignment...';
+    })
+    .catch(e => {
+      console.warn('[AR] restore failed', e);
+      if (gen !== ar.restoreGen) return;
+      ar.restoring = false; store.del(ANCHOR_KEY);
+      ar.note = 'Saved alignment not found here: align again (A).';
+    });
+  purgePersistentAnchors(session, id);      // tidy up anchors left over from older saves
+}
+
+// ---- twin look -----------------------------------------------------------------------------
+function toggleHolo() {
+  ar.holo = !ar.holo;
+  try { localStorage.setItem('so101-twin-holo', ar.holo ? '1' : '0'); } catch {}
+  applyLook();
+  ar.note = ar.holo ? 'Hologram on' : 'Hologram off (labels stay)';
+}
+function toggleHelp() {
+  ar.hud = !ar.hud;
+  try { localStorage.setItem('so101-twin-help', ar.hud ? '1' : '0'); } catch {}
+  ar.note = ar.hud ? 'Help panel on' : 'Help panel hidden (X or Help shows it again)';
+}
+function cycleLabels() { labelMode = (labelMode + 1) % LABEL_MODES.length; ar.note = `Labels: ${LABEL_MODES[labelMode]}`; }
+let actualMats = null;
+function applyLook() {
+  if (!actualBot) return;
+  if (!actualMats) {
+    actualMats = new Set();
+    actualBot.traverse(o => { if (o.isMesh && o.material !== liftMat) actualMats.add(o.material); });
+  }
+  ar.look = (ar.editing || ar.mode !== 'free') ? 1 : (ar.holo ? 0 : 2);   // aligning always shows it see-through
+  const look = LOOKS[ar.look];
+  for (const m of actualMats) {
+    m.transparent = look === 'see-through';
+    m.opacity = look === 'see-through' ? 0.35 : 1;
+    m.depthWrite = look !== 'see-through';
+    m.needsUpdate = true;
+  }
+  actualBot.visible = look !== 'hidden';
+  ghostBot.visible = look !== 'hidden';
+}
+
+// ---- controllers ---------------------------------------------------------------------------
+const arControllers = [0, 1].map(i => {
+  const c = renderer.xr.getController(i);          // target-ray space: controllers AND tracked hands
+  const dot = new THREE.Mesh(new THREE.SphereGeometry(0.005, 16, 12),
+                             new THREE.MeshBasicMaterial({ color: 0x4aa3ff, depthTest: false }));
+  dot.renderOrder = 22;
+  c.add(dot);                                       // the exact point that placing / capturing uses
+  const ray = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]),
+                             new THREE.LineBasicMaterial({ color: 0x4aa3ff, transparent: true, opacity: 0.8, depthTest: false }));
+  ray.renderOrder = 25; ray.visible = false;
+  c.add(ray); c.userData.ray = ray;                 // shown only while pointing at a menu
+  c.addEventListener('select', () => onSelect(c));
+  c.addEventListener('squeezestart', () => { if (ar.mode === 'grab' && !c.userData.isHand) beginGrab({ ctrl: c }); });
+  c.addEventListener('squeezeend', () => { if (ar.drag?.src?.ctrl === c) endGrab(); });
+  c.addEventListener('disconnected', () => { c.userData.connected = false; c.userData.hover = null; ray.visible = false; });
+  c.addEventListener('connected', e => {
+    c.userData.connected = true;
+    c.userData.handedness = e.data.handedness;
+    c.userData.isHand = !!e.data.hand;
+    dot.visible = !e.data.hand;                     // hands use the fingertip pointer instead
+  });
+  scene.add(c);
+  return c;
+});
+
+function edge(key, down, fn) {
+  const was = ar.buttons.get(key) || false;
+  ar.buttons.set(key, down);
+  if (down && !was) fn();
+}
+const dz = v => (Math.abs(v) < 0.15 ? 0 : Math.sign(v) * ((Math.abs(v) - 0.15) / 0.85) ** 2);   // dead zone + fine control
+
+function pollInputs(session, dt) {
+  let tunedThisFrame = false, gripHeld = false;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad, h = src.handedness;
+    if (!gp || (h !== 'left' && h !== 'right')) continue;
+    const btn = i => !!gp.buttons[i]?.pressed;
+    if (h === 'right') {
+      edge('A', btn(4), () => {
+        if (ar.editing) return commitEdit();
+        if (state?.replay?.active) { doStop(); ar.note = 'Replay stopped.'; return; }   // A = STOP during a replay
+        return ar.aligned ? lockedNote() : beginEdit();
+      });
+      edge('R3', btn(3), () => {
+        if (!ar.editing) return lockedNote();
+        return ar.mode === 'calib' ? startGrabAlign() : startCalibration();
+      });
+      edge('B', btn(5), toggleHolo);
+    } else {
+      edge('X', btn(4), () => (ar.editing ? cancelEdit() : toggleHelp()));
+      edge('L3', btn(3), cycleLabels);
+      edge('Y', btn(5), () => (ar.menuOpen ? closeMenu() : openMenu()));
+    }
+    if (!btn(1)) continue;                            // fine-tune only while the grip is held
+    if (!ar.editing) continue;                        // ...and only while aligning: the alignment is locked otherwise
+    gripHeld = true;
+    if (ar.drag) continue;                            // the grip is grabbing the motor, not tuning
+    const sx = dz(gp.axes[2] || 0), sy = dz(gp.axes[3] || 0);
+    if (!sx && !sy) continue;
+    tunedThisFrame = true;
+    if (h === 'right') {
+      turnAbout(liftCenter(), -sx * TUNE_TURN * dt);   // stick right = clockwise from above, about the align motor
+      twinRoot.position.y -= sy * TUNE_MOVE * dt;     // stick forward (negative y) = up
+    } else {                                          // slide in the robot's own frame
+      const local = new THREE.Vector3(-sy * TUNE_MOVE * dt, 0, sx * TUNE_MOVE * dt);
+      twinRoot.position.add(local.applyQuaternion(twinRoot.quaternion));
+    }
+  }
+  if (tunedThisFrame) ar.tuning = true;
+  if (ar.tuning && !gripHeld && !ar.drag) {                       // grip released after tuning: save the new pose
+    ar.tuning = false; ar.aligned = true;
+    dropAnchor();
+    ar.quality = !ar.quality ? 'fine-tuned by hand'
+      : (/fine-tuned|motor/.test(ar.quality) ? ar.quality : ar.quality + ' (fine-tuned)');
+    ar.anchorPending = true;
+  }
+}
+
+// ---- hands ---------------------------------------------------------------------------------
+const hands = { left: null, right: null };
+const _t = new THREE.Vector3(), _t2 = new THREE.Vector3();
+function joint(h, name) {
+  const j = h?.joints?.[name];
+  return j && j.visible ? j : null;
+}
+function jointPos(h, name, out = new THREE.Vector3()) {
+  const j = joint(h, name);
+  return j ? j.getWorldPosition(out) : null;
+}
+function pinchPos(h, out = new THREE.Vector3()) {
+  const a = jointPos(h, 'thumb-tip', _t2), b = jointPos(h, 'index-finger-tip', out);
+  return a && b ? b.add(a).multiplyScalar(0.5) : null;
+}
+function pointerHand() { return joint(hands.right, 'index-finger-tip') ? hands.right : (joint(hands.left, 'index-finger-tip') ? hands.left : null); }
+function handsActive() {
+  const s = renderer.xr.getSession();
+  return !!s && [...s.inputSources].some(src => src.hand);
+}
+
+const pointerDot = new THREE.Mesh(new THREE.SphereGeometry(0.004, 16, 12),
+                                  new THREE.MeshBasicMaterial({ color: 0x4aa3ff, depthTest: false }));
+pointerDot.renderOrder = 22; pointerDot.visible = false;
+const dwellRing = new THREE.Mesh(new THREE.RingGeometry(0.009, 0.012, 40, 1, 0, Math.PI * 2),
+                                 new THREE.MeshBasicMaterial({ color: 0x3ecf8e, depthTest: false, side: THREE.DoubleSide }));
+dwellRing.renderOrder = 22; dwellRing.visible = false;
+scene.add(pointerDot, dwellRing);
+
+[0, 1].forEach(i => {
+  const h = renderer.xr.getHand(i);
+  scene.add(h);
+  h.addEventListener('connected', e => { h.userData.handedness = e.data.handedness; hands[e.data.handedness] = h; });
+  h.addEventListener('disconnected', () => { if (hands[h.userData.handedness] === h) hands[h.userData.handedness] = null; });
+  h.addEventListener('pinchstart', () => onPinchStart(h));
+  h.addEventListener('pinchend', () => onPinchEnd(h));
+});
+
+// Where the fingertip touches: the index-finger-tip joint sits at the centre of the fingertip, one
+// joint-radius above the surface you press on, so step down by that radius.
+function touchPoint(h, out = new THREE.Vector3()) {
+  const j = joint(h, 'index-finger-tip');
+  if (!j) return null;
+  j.getWorldPosition(out);
+  out.y -= j.jointRadius ?? 0.008;
+  return out;
+}
+
+function onPinchStart(h) {
+  const hd = h.userData.handedness;
+  if (arControllers.some(c => c.userData.handedness === hd && c.userData.hover)) return;   // it's a menu press
+  if (ar.mode === 'grab') { if (!ar.drag) beginGrab({ hand: h }); return; }
+  if (ar.mode === 'calib' && hd === 'left') {              // left pinch = capture the right fingertip now
+    const ph = pointerHand();
+    if (ph && ph !== h) {
+      capturePointAt(touchPoint(ph));
+      Object.assign(ar.dwell, { pos: null, n: 0, armed: false, last: touchPoint(ph) });
+    }
+    return;
+  }
+  if (ar.tuneMode) {
+    const start = pinchPos(h);
+    if (!start) return;
+    ar.drag = { type: hd === 'right' ? 'slide' : 'turn', h, hd, start: start.clone(),
+                pos: twinRoot.position.clone(), yaw: rootYaw(), pivot: liftCenter() };
+    ar.tuning = true; dropAnchor();
+  }
+}
+function onPinchEnd(h) {                                    // pollInputs then saves the pose
+  if (ar.drag?.src?.hand === h) return endGrab();
+  if (ar.drag?.h === h) ar.drag = null;
+}
+
+function updateDrag(head) {
+  const d = ar.drag;
+  if (!d) return;
+  if (d.type === 'grab') {                                 // 1:1: the motor follows your hand, wrist twist turns it
+    const sp = grabSourcePose(d.src);
+    if (!sp) return;
+    const dYaw = sp.yaw == null || d.yaw0 == null ? 0 : wrapPi(sp.yaw - d.yaw0);
+    const pivotNow = d.c0.clone().add(sp.p.clone().sub(d.p0));
+    const root0 = d.root0.clone().add(sp.p.clone().sub(d.p0));
+    turnAbout(pivotNow, dYaw, root0, d.rootYaw0);
+    return;
+  }
+  const cur = pinchPos(d.h, _t);
+  if (!cur) return;
+  const delta = cur.sub(d.start).multiplyScalar(HAND_SCALE);
+  if (d.type === 'slide') {
+    twinRoot.position.copy(d.pos).add(delta);
+  } else {                                                 // sideways motion turns it, about the align motor
+    _f.set(1, 0, 0).applyQuaternion(head.getWorldQuaternion(_q)); _f.y = 0; _f.normalize();
+    turnAbout(d.pivot, -delta.dot(_f) * HAND_TURN, d.pos, d.yaw);   // hand right = clockwise from above
+  }
+}
+
+function updateDwell(now, head) {
+  const dw = ar.dwell;
+  dwellRing.visible = false;
+  const ph = pointerHand();
+  if (ar.mode !== 'calib' || !ph) { dw.pos = null; return; }
+  const tip = touchPoint(ph, _t);
+  if (!dw.armed) {                                          // after a capture, move away before the next one
+    if (!dw.last || tip.distanceTo(dw.last) > 0.03) dw.armed = true;
+    return;
+  }
+  if (!dw.pos || tip.distanceTo(dw.pos) > DWELL_TOL) {
+    dw.pos = tip.clone(); dw.t0 = now; dw.sum.set(0, 0, 0); dw.n = 0;
+    return;
+  }
+  dw.sum.add(tip); dw.n++;
+  const k = (now - dw.t0) / DWELL_MS;
+  dwellRing.visible = true;
+  dwellRing.position.copy(dw.pos);
+  dwellRing.lookAt(head.getWorldPosition(_p));
+  dwellRing.scale.setScalar(0.4 + 0.6 * Math.min(k, 1));
+  dwellRing.material.color.set(CAL_COLORS[Math.min(ar.captured.length, 1)]);
+  if (k >= 1) {
+    const avg = dw.sum.clone().multiplyScalar(1 / Math.max(dw.n, 1));   // average out fingertip jitter
+    dw.armed = false; dw.last = avg.clone(); dw.pos = null;
+    capturePointAt(avg);
+  }
+}
+
+// ---- AR panels: buttons you can poke with a fingertip or point at with a controller/hand ray ---
+// Items are plain data: {t, x, y, size, b, c} for text, {btn, id, label, x, y, w, h, on, danger,
+// disabled} for buttons; positions in metres from the panel's top-left corner.
+class ARPanel {
+  constructor(w, h, { px = 3000, bg = true } = {}) {
+    this.w = w; this.h = h; this.s = px; this.bg = bg;
+    this.canvas = document.createElement('canvas');
+    this.canvas.width = Math.round(w * px); this.canvas.height = Math.round(h * px);
+    this.ctx = this.canvas.getContext('2d');
+    this.tex = new THREE.CanvasTexture(this.canvas); this.tex.colorSpace = THREE.SRGBColorSpace;
+    this.mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({
+      map: this.tex, transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }));
+    this.mesh.renderOrder = 24; this.mesh.visible = false; this.mesh.userData.panel = this;
+    this.items = []; this.hover = null; this.key = '';
+    this.poke = { armed: false, until: 0 };
+    scene.add(this.mesh);
+  }
+  set(items) { this.items = items; this.redraw(); }
+  buttons() { return this.items.filter(i => i.btn); }
+  redraw() {
+    const key = JSON.stringify(this.items) + '|' + this.hover;
+    if (key === this.key) return;
+    this.key = key;
+    const c = this.ctx, s = this.s;
+    c.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    if (this.bg) { c.fillStyle = 'rgba(22,23,28,0.93)'; c.beginPath(); c.roundRect(0, 0, this.canvas.width, this.canvas.height, 0.012 * s); c.fill(); }
+    for (const it of this.items) {
+      if (it.btn) {
+        const hot = this.hover === it.id && !it.disabled;
+        c.fillStyle = it.disabled ? 'rgba(48,50,58,0.75)' : it.danger ? '#e5484d' : it.on ? '#ff9f1a' : hot ? '#4aa3ff' : '#2f313b';
+        c.beginPath(); c.roundRect(it.x * s, it.y * s, it.w * s, it.h * s, 0.006 * s); c.fill();
+        if (hot && it.danger) { c.strokeStyle = '#fff'; c.lineWidth = 0.002 * s; c.stroke(); }
+        c.fillStyle = it.disabled ? '#6b6e78' : it.danger ? '#fff' : (it.on || hot) ? '#111' : '#e8e8e8';
+        c.font = `700 ${Math.round((it.size || it.h * 0.48) * s)}px system-ui, sans-serif`;
+        c.textAlign = it.align === 'left' ? 'left' : 'center'; c.textBaseline = 'middle';
+        const tx = it.align === 'left' ? (it.x + 0.008) * s : (it.x + it.w / 2) * s;
+        c.fillText(it.label, tx, (it.y + it.h / 2) * s, it.w * s * 0.94);
+      } else {
+        c.fillStyle = it.c || '#e8e8e8';
+        c.font = `${it.b ? 700 : 500} ${Math.round(it.size * s)}px system-ui, sans-serif`;
+        c.textAlign = it.align || 'left'; c.textBaseline = 'middle';
+        c.fillText(it.t, it.x * s, it.y * s, (it.maxW || (this.w - it.x - 0.01)) * s);
+      }
+    }
+    this.tex.needsUpdate = true;
+  }
+  buttonAt(local) {               // local: a point in the panel mesh's frame
+    const x = local.x + this.w / 2, y = this.h / 2 - local.y;
+    return this.buttons().find(b => !b.disabled && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) || null;
+  }
+}
+
+const actions = {};               // button id -> what it does
+let clickButton = function (p, b) {
+  const now = performance.now();
+  console.debug('[AR] press', b.id);
+  if (b.confirm && !(ar.confirm.id === b.id && now < ar.confirm.until)) {   // first tap only arms it
+    ar.confirm = { id: b.id, until: now + 4000 };
+    return;
+  }
+  ar.confirm.id = null;
+  (actions[b.id] || (() => {}))(b);
+};
+
+// A press = the fingertip arrives at the panel FROM THE FRONT. It re-arms only after the finger backs
+// off again, so pulling the finger back through the panel can never press a second time.
+const POKE_PRESS = 0.008, POKE_REARM = 0.025, POKE_NEAR = 0.15;
+const raycaster = new THREE.Raycaster();
+const panels = [];
+function updatePanels(now) {
+  const vis = panels.filter(p => p.mesh.visible);
+  for (const p of panels) p.hoverNow = null;
+  const tip = jointPos(hands.right, 'index-finger-tip', _t2);
+  for (const p of vis) {                                   // 1) poke with the right index fingertip
+    if (!tip) { p.poke.armed = false; continue; }
+    const l = p.mesh.worldToLocal(tip.clone());           // l.z > 0: in front of the panel (your side)
+    const inside = Math.abs(l.x) <= p.w / 2 && Math.abs(l.y) <= p.h / 2 + 0.006;
+    const b = inside ? p.buttonAt(l) : null;
+    if (b && l.z < 0.05 && l.z > -0.03) p.hoverNow = b.id;
+    if (l.z > POKE_REARM) p.poke.armed = true;
+    if (b && p.poke.armed && l.z < POKE_PRESS && l.z > -0.03 && now > p.poke.until) {
+      p.poke.armed = false; p.poke.until = now + 300;
+      clickButton(p, b);
+    }
+  }
+  for (const c of arControllers) {                         // 2) point a controller / hand ray at it
+    c.userData.hover = null;
+    const ray = c.userData.ray;
+    if (!vis.length || !c.userData.connected) { if (ray) ray.visible = false; continue; }
+    c.getWorldPosition(_t); c.getWorldQuaternion(_q);
+    raycaster.set(_t, new THREE.Vector3(0, 0, -1).applyQuaternion(_q));
+    const hits = raycaster.intersectObjects(vis.map(p => p.mesh), false);
+    if (hits.length && hits[0].distance > 0.06) {         // closer than 6 cm: that is a poke, not pointing
+      const hit = hits[0], p = hit.object.userData.panel;
+      const b = p.buttonAt(p.mesh.worldToLocal(hit.point.clone()));
+      c.userData.hover = { p, b };
+      if (b) p.hoverNow = b.id;
+      ray.visible = true; ray.scale.z = hit.distance;
+    } else if (ray) ray.visible = false;
+  }
+  for (const p of vis) { p.hover = p.hoverNow; p.redraw(); }
+}
+
+// Wrist bar: above the LEFT wrist, contents depend on what you are doing.
+const wristBar = new ARPanel(0.24, 0.04, { px: 7500, bg: false });
+panels.push(wristBar);
+function wristItems() {
+  const ids = ar.editing ? ['done', 'cancel', 'tune', 'holo']
+            : state?.replay?.active ? ['stop', 'menu', 'holo', 'labels']
+            : !ar.aligned ? ['align', 'menu', 'holo', 'help']
+            : ['menu', 'holo', 'labels', 'help'];
+  const names = { done: 'Done', cancel: 'Cancel', tune: 'Tune', holo: ar.holo ? 'Holo on' : 'Holo off', stop: 'STOP',
+                  menu: ar.menuOpen ? 'Close' : 'Menu', labels: 'Labels', align: 'Align', help: ar.hud ? 'Help on' : 'Help off' };
+  const bw = 0.24 / ids.length;
+  return ids.map((id, i) => ({ btn: true, id, label: names[id], x: i * bw + 0.002, y: 0.002, w: bw - 0.004, h: 0.036,
+                               danger: id === 'stop', on: (id === 'tune' && ar.tuneMode) || (id === 'done') }));
+}
+function updateWristBar(head) {
+  const wrist = jointPos(hands.left, 'wrist', _t);
+  const show = handsActive() && !!wrist;
+  wristBar.mesh.visible = show;
+  if (!show) { wristBar.poke.armed = false; return; }
+  const tip = jointPos(hands.right, 'index-finger-tip', _t2);
+  const near = tip && wristBar.placed && tip.distanceTo(wristBar.mesh.position) < POKE_NEAR;
+  if (!near) {                                             // follow the wrist only while you are not poking it
+    const want = wrist.clone(); want.y += 0.09;
+    wristBar.mesh.position.lerp(want, wristBar.placed ? 0.35 : 1);
+    wristBar.placed = true;
+    wristBar.mesh.lookAt(head.getWorldPosition(_p));      // +Z of the bar points at your face
+  }
+  wristBar.set(wristItems());
+}
+
+// AR menu: opened with Y (controller) or Menu (wrist bar); floats where you opened it.
+const MENU_W = 0.36, MENU_H = 0.315, ROWS = 5;
+const arMenu = new ARPanel(MENU_W, MENU_H, { px: 3000 });
+panels.push(arMenu);
+async function loadRecordings() {
+  try {
+    const r = await api('/api/recordings');
+    ar.rec.files = r.data.files || [];
+    ar.rec.pick = ar.rec.pick.filter(n => ar.rec.files.some(f => f.name === n));
+    ar.rec.page = Math.min(ar.rec.page, Math.max(0, Math.ceil(ar.rec.files.length / ROWS) - 1));
+    ar.rec.loaded = true;
+  } catch { ar.note = 'Could not load recordings.'; }
+}
+function openMenu() {
+  const head = renderer.xr.getCamera();
+  head.getWorldPosition(_p); head.getWorldQuaternion(_q);
+  _f.set(0, 0, -1).applyQuaternion(_q); _f.y = 0; _f.normalize();
+  _f.applyAxisAngle(_up, 0.55);                             // ~30 deg to your LEFT, so the robot ahead stays visible
+  arMenu.mesh.position.copy(_p).addScaledVector(_f, 0.45); arMenu.mesh.position.y -= 0.15;   // arm's reach, a bit low
+  arMenu.mesh.lookAt(_p);
+  arMenu.mesh.visible = true; ar.menuOpen = true;
+  loadRecordings();
+}
+function closeMenu() { arMenu.mesh.visible = false; ar.menuOpen = false; ar.confirm.id = null; }
+
+function menuItems(now) {
+  const I = [];
+  const R = state?.replay, playing = !!R?.active, rec = ar.rec;
+  I.push({ t: 'SO-101  ·  AR menu', x: 0.015, y: 0.021, size: 0.014, b: true });
+  I.push({ btn: true, id: 'help', label: ar.hud ? 'Help panel: on' : 'Help panel: off', x: MENU_W - 0.172, y: 0.006, w: 0.1, h: 0.028, size: 0.0105 });
+  I.push({ btn: true, id: 'close', label: 'Close', x: MENU_W - 0.067, y: 0.006, w: 0.057, h: 0.028, size: 0.011 });
+  I.push({ t: 'REPLAY  (tap files: they play in the order you tap)', x: 0.015, y: 0.049, size: 0.0085, c: '#8a8d99', b: true });
+  const files = rec.files, pages = Math.max(1, Math.ceil(files.length / ROWS));
+  const page = files.slice(rec.page * ROWS, rec.page * ROWS + ROWS);
+  if (!rec.loaded) I.push({ t: 'Loading...', x: 0.02, y: 0.08, size: 0.01, c: '#8a8d99' });
+  else if (!files.length) I.push({ t: 'No recordings yet (record on the PC page).', x: 0.02, y: 0.08, size: 0.01, c: '#8a8d99' });
+  page.forEach((f, i) => {
+    const k = rec.pick.indexOf(f.name);
+    const dur = f.duration >= 60 ? `${Math.floor(f.duration / 60)}m${Math.round(f.duration % 60)}s` : `${f.duration.toFixed(1)}s`;
+    I.push({ btn: true, id: 'file:' + f.name, label: `${k >= 0 ? (k + 1) + '.  ' : '     '}${f.name}   ${dur}`,
+             x: 0.015, y: 0.06 + i * 0.031, w: 0.288, h: 0.027, size: 0.0115, align: 'left', on: k >= 0, disabled: playing });
+  });
+  I.push({ btn: true, id: 'up', label: 'Up', x: 0.309, y: 0.06, w: 0.036, h: 0.074, size: 0.0105, disabled: rec.page === 0 });
+  I.push({ btn: true, id: 'down', label: 'Down', x: 0.309, y: 0.137, w: 0.036, h: 0.074, size: 0.0105, disabled: rec.page >= pages - 1 });
+  // play / stop / speed
+  I.push({ btn: true, id: 'play', label: rec.pick.length > 1 ? `Play ${rec.pick.length}` : 'Play', x: 0.015, y: 0.22, w: 0.085, h: 0.032,
+           disabled: playing || !rec.pick.length });
+  I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.105, y: 0.22, w: 0.09, h: 0.032, danger: true });
+  const sp = Math.round(state?.speed ?? 0);
+  I.push({ btn: true, id: 'slower', label: '−', x: 0.205, y: 0.22, w: 0.034, h: 0.032 });
+  I.push({ t: `${sp}°/s`, x: 0.2765, y: 0.236, size: 0.012, b: true, align: 'center' });
+  I.push({ btn: true, id: 'faster', label: '+', x: 0.311, y: 0.22, w: 0.034, h: 0.032 });
+  // view + alignment
+  const armed = id => ar.confirm.id === id && now < ar.confirm.until;
+  I.push({ btn: true, id: 'holo', label: ar.holo ? 'Hologram: on' : 'Hologram: off', x: 0.015, y: 0.259, w: 0.08, h: 0.028, size: 0.0105 });
+  I.push({ btn: true, id: 'labels', label: `Labels: ${LABEL_MODES[labelMode]}`, x: 0.099, y: 0.259, w: 0.085, h: 0.028, size: 0.0105 });
+  if (ar.editing) {
+    I.push({ btn: true, id: 'done', label: 'Done', x: 0.188, y: 0.259, w: 0.075, h: 0.028, on: true, size: 0.0105 });
+    I.push({ btn: true, id: 'cancel', label: 'Cancel', x: 0.267, y: 0.259, w: 0.078, h: 0.028, size: 0.0105 });
+  } else {
+    I.push({ btn: true, id: 'realign', label: armed('realign') ? 'Tap to confirm' : (ar.aligned ? 'Realign...' : 'Align'),
+             x: 0.188, y: 0.259, w: 0.075, h: 0.028, confirm: ar.aligned, on: armed('realign'), size: 0.0105 });
+    I.push({ btn: true, id: 'forget', label: armed('forget') ? 'Tap to confirm' : 'Forget...',
+             x: 0.267, y: 0.259, w: 0.078, h: 0.028, confirm: true, on: armed('forget'), disabled: !ar.aligned, size: 0.0105 });
+  }
+  // status line
+  let st = ar.note || '';
+  if (playing) st = `Playing ${R.file}${R.count > 1 ? ` (${R.index + 1}/${R.count})` : ''}  ` +
+                    (R.phase === 'approach' ? 'moving to start...' : `${R.t.toFixed(1)} / ${R.duration.toFixed(1)} s`);
+  else if (ar.confirm.id && now < ar.confirm.until) st = 'Tap the same button again within 4 s to confirm.';
+  I.push({ t: st, x: 0.015, y: 0.302, size: 0.0095, c: playing ? '#4aa3ff' : '#8a8d99' });
+  return I;
+}
+
+// what every button does
+Object.assign(actions, {
+  close: closeMenu,
+  menu: () => (ar.menuOpen ? closeMenu() : openMenu()),
+  up: () => { ar.rec.page = Math.max(0, ar.rec.page - 1); },
+  down: () => { ar.rec.page = ar.rec.page + 1; },
+  play: async () => {
+    for (const k in pending) delete pending[k];
+    const r = await api('/api/replay/start', { files: ar.rec.pick });
+    ar.note = r.data.msg || (r.ok ? 'Replaying' : 'Could not start the replay');
+    if (r.ok) closeMenu();                                  // out of your way; STOP: A, wrist bar STOP, or Y
+
+  },
+  stop: async () => { await doStop(); ar.note = 'Stopped.'; },
+  slower: () => api('/api/speed', { speed: Math.max(1, Math.round((state?.speed ?? 30) - 5)) }),
+  faster: () => api('/api/speed', { speed: Math.min(cfg.speed_ceiling, Math.round((state?.speed ?? 30) + 5)) }),
+  holo: toggleHolo,
+  labels: cycleLabels,
+  help: toggleHelp,
+  align: beginEdit,
+  realign: () => { beginEdit(); closeMenu(); },
+  forget: () => { forgetAlignment(); },
+  done: commitEdit,
+  cancel: cancelEdit,
+  tune: () => {
+    if (!ar.editing) return lockedNote();
+    if (ar.mode === 'grab') endGrabAlign('');
+    ar.tuneMode = !ar.tuneMode; ar.drag = null;
+    ar.note = ar.tuneMode ? 'Tune on: pinch-drag right hand = slide, left hand = turn.' : 'Tune off: pinch the motor to grab again.';
+    if (!ar.tuneMode) startGrabAlign();
+  },
+});
+function fileClick(name) {
+  const k = ar.rec.pick.indexOf(name);
+  if (k >= 0) ar.rec.pick.splice(k, 1); else ar.rec.pick.push(name);
+}
+const _clickButton = clickButton;
+// file rows carry their name in the id
+clickButton = function (p, b) { if (b.id.startsWith('file:')) return fileClick(b.id.slice(5)); return _clickButton(p, b); };
+
+function updatePointer() {
+  const ph = pointerHand();
+  const tip = ph && handsActive() ? touchPoint(ph, _t) : null;
+  pointerDot.visible = !!tip;
+  if (tip) pointerDot.position.copy(tip);
+}
+
+// ---- Phase 2: motor labels, glow on the moving motor, degrees moved ------------------------
+// Each joint is driven by an STS3215 bolted to the joint's PARENT link. We find that servo by its mesh
+// file name, then for every joint show: a label (name, live angle; while moving: degrees moved in this
+// motion and speed), an orange glow on the servo that is moving, and an arc sweeping from where the
+// motion started to where the joint is now. Uses only the live angles the page already polls.
+const LABEL_MODES = ['all', 'moving only', 'off'];
+const MOVE_ON = 3.0, MOVE_OFF = 1.5;     // deg/s (gripper: %/s) to start / stop counting as "moving"
+const MOVE_HOLD_MS = 400;                // must stay slow this long before a motion is considered over
+const MOVE_STEP = 1.5;                   // deg (gripper %): moving this much between two readings counts as moving
+const SHOW_AFTER_MS = 3000;              // keep showing "moved X" this long after a motion ends
+const ARC_R = 0.035;
+const activeMat = new THREE.MeshStandardMaterial({ color: 0xff9f1a, emissive: 0x9a4a00, roughness: 0.45 });
+const overlay = {};                      // per joint: { label, line, arc, motor: {visual, meshes}, phi0 }
+const motion = {};                       // per joint: { speed, active, start, startRad, slowSince, endAt, delta }
+let overlaysBuilt = false, labelMode = 0;
+let lastSample = null, lastSampleT = 0;
+
+function servoVisual(j) {
+  const link = actualJ[j]?.parent;
+  if (!link) return null;
+  for (const c of link.children) {
+    const m = c.isURDFVisual && c.urdfNode?.querySelector?.('mesh');
+    if (m && /sts3215/.test(m.getAttribute('filename') || '')) return c;
+  }
+  return null;
+}
+function buildOverlays() {
+  if (overlaysBuilt || !actualBot) return;
+  findLiftMotor();                       // remember the align motor's own materials before anything recolours it
+  for (const j of JOINTS) {
+    const v = servoVisual(j);
+    const meshes = [];
+    v?.traverse(o => { if (o.isMesh) meshes.push({ mesh: o, mat: o.material }); });
+    const label = makeTextPanel(0.085, 0.036, 2400);
+    label.visible = false;
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+                                new THREE.LineBasicMaterial({ color: 0xe8e8e8, transparent: true, opacity: 0.6, depthTest: false }));
+    line.renderOrder = 19; line.visible = false;
+    const arc = new THREE.Mesh(new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ color: 0xff9f1a, transparent: true, opacity: 0.85, depthTest: false, side: THREE.DoubleSide }));
+    arc.renderOrder = 19; arc.visible = false;
+    scene.add(label, line, arc);
+    // angle of the child link at joint value 0, in the joint's rotation plane: lets the arc sit on the link
+    const child = actualJ[j].children.find(c => c.isURDFLink);
+    const next = child?.children.find(c => c.isURDFJoint);
+    const phi0 = next && Math.hypot(next.position.x, next.position.y) > 0.005 ? Math.atan2(next.position.y, next.position.x) : 0;
+    overlay[j] = { label, line, arc, motor: { visual: v, meshes }, phi0, glowing: false, arcKey: '' };
+    motion[j] = { speed: 0, active: false, start: 0, startRad: 0, slowSince: 0, endAt: 0, delta: 0 };
+  }
+  overlaysBuilt = true;
+}
+function setMotorGlow(j, on) {
+  const o = overlay[j];
+  if (!o || o.glowing === on) return;
+  o.glowing = on;
+  for (const e of o.motor.meshes) e.mesh.material = on ? activeMat : e.mat;
+}
+function clearMotorGlows() { for (const j of JOINTS) setMotorGlow(j, false); }
+function hideOverlays() {
+  for (const j of JOINTS) { const o = overlay[j]; if (!o) continue; o.label.visible = o.line.visible = o.arc.visible = false; }
+  clearMotorGlows();
+}
+
+function sampleMotion(now) {           // called every frame; only does work when a new /api/state arrived
+  if (!state || state === lastSample) return;
+  if (lastSample && state.t != null && state.t === lastSample.t) return;   // same motor reading polled twice
+  // Speed uses the SERVER's timestamp of each motor reading, so network or frame-rate hiccups
+  // cannot make a fast move look slow (or the other way round).
+  const dt = !lastSample ? 0 : (state.t != null && lastSample.t != null ? state.t - lastSample.t : (now - lastSampleT) / 1000);
+  for (const j of JOINTS) {
+    const m = motion[j], a = state.actual[j];
+    const step = lastSample ? Math.abs(a - lastSample.actual[j]) : 0;
+    if (lastSample && dt > 0.005) {
+      const inst = step / dt;
+      const k = Math.min(1, dt / 0.15);            // smooth fast updates, trust a late one fully
+      m.speed = (1 - k) * m.speed + k * inst;
+    }
+    const moving = m.speed > MOVE_ON || step > MOVE_STEP;
+    if (!m.active && moving) {                     // a motion starts: count from the previous sample
+      m.active = true; m.slowSince = 0;
+      m.start = lastSample ? lastSample.actual[j] : a;
+      m.startRad = toRad(j, m.start);
+    } else if (m.active) {
+      if (m.speed < MOVE_OFF && step < 0.3) {
+        m.slowSince = m.slowSince || now;
+        if (now - m.slowSince > MOVE_HOLD_MS) { m.active = false; m.endAt = now; }
+      } else m.slowSince = 0;
+    }
+    if (m.active || now - m.endAt < SHOW_AFTER_MS) m.delta = a - m.start;
+  }
+  lastSample = state; lastSampleT = now;
+}
+
+const _c = new THREE.Vector3(), _b = new THREE.Vector3(), _d = new THREE.Vector3(), _hq = new THREE.Quaternion();
+function updateOverlays(head, now) {
+  buildOverlays();
+  if (!overlaysBuilt || !state) return;
+  sampleMotion(now);
+  const mode = LABEL_MODES[labelMode];
+  head.getWorldPosition(_p);
+  twinRoot.getWorldPosition(_b);
+  for (const j of JOINTS) {
+    const o = overlay[j], m = motion[j];
+    const recent = m.active || now - m.endAt < SHOW_AFTER_MS;
+    // glow the servo that is moving (not while the align motor is glowing cyan)
+    setMotorGlow(j, m.active && ar.mode !== 'grab');
+    const show = mode === 'all' || (mode === 'moving only' && recent);
+    o.label.visible = o.line.visible = show;
+    o.arc.visible = recent && mode !== 'off' && Math.abs(m.delta) > 0.5;
+    if (!show && !o.arc.visible) continue;
+
+    // servo centre in the room (falls back to the joint origin)
+    if (o.motor.visual) _box.setFromObject(o.motor.visual).getCenter(_c); else actualJ[j].getWorldPosition(_c);
+    if (show) {
+      // Lay labels out SIDEWAYS as seen from your eyes (never toward you): joints alternate left/right,
+      // and each side's labels step upwards, so neighbouring motors never share a spot.
+      _d.set(1, 0, 0).applyQuaternion(head.getWorldQuaternion(_hq)); _d.y = 0; _d.normalize();   // your right
+      const k = JOINTS.indexOf(j), side = k % 2 ? -1 : 1, tier = Math.floor(k / 2);
+      o.label.position.copy(_c).addScaledVector(_d, side * (0.07 + 0.015 * tier))
+        .add(_up.clone().multiplyScalar(0.015 + 0.03 * tier));
+      o.label.lookAt(_p);
+      o.label.scale.setScalar(m.active ? 1.35 : (recent ? 1.0 : 0.7));   // the engaged motor stands out
+      const pos = o.line.geometry.attributes.position;
+      pos.setXYZ(0, _c.x, _c.y, _c.z); pos.setXYZ(1, o.label.position.x, o.label.position.y, o.label.position.z);
+      pos.needsUpdate = true; o.line.geometry.computeBoundingSphere();
+      o.line.material.color.set(m.active ? 0xff9f1a : 0xe8e8e8);
+      const u = UNIT(j), ang = state.actual[j];
+      const lines = [{ t: j.replace('_', ' '), b: true, c: m.active ? '#ff9f1a' : '#e8e8e8' },
+                     { t: `${ang >= 0 ? ' ' : ''}${ang.toFixed(1)}${u}`, b: true }];
+      if (recent) lines.push({ t: `${m.active ? 'Δ' : 'moved'} ${m.delta >= 0 ? '+' : ''}${m.delta.toFixed(1)}${u}` +
+                                  (m.active && m.speed >= MOVE_OFF ? `  ${m.speed.toFixed(0)}${u}/s` : ''), c: m.active ? '#ff9f1a' : '#8a8d99' });
+      o.label.userData.draw(lines, m.active ? 'rgba(40,24,6,0.88)' : 'rgba(22,23,28,0.78)');
+    }
+    if (o.arc.visible) {
+      // arc in the joint's rotation plane: from where this motion started to where the joint is now
+      const jt = actualJ[j];
+      jt.parent.localToWorld(o.arc.position.copy(jt.position));
+      jt.parent.getWorldQuaternion(_hq);
+      o.arc.quaternion.copy(_hq).multiply(jt.origQuaternion || new THREE.Quaternion());
+      const a0 = o.phi0 + m.startRad, a1 = o.phi0 + toRad(j, state.actual[j]);
+      const key = a0.toFixed(3) + ':' + a1.toFixed(3);
+      if (key !== o.arcKey) {
+        o.arcKey = key;
+        o.arc.geometry.dispose();
+        o.arc.geometry = new THREE.RingGeometry(ARC_R * 0.82, ARC_R, 48, 1, Math.min(a0, a1), Math.max(Math.abs(a1 - a0), 1e-3));
+      }
+      o.arc.material.opacity = m.active ? 0.85 : 0.4;
+    }
+  }
+}
+
+function replayLine() {
+  const rp = state?.replay;
+  if (!rp?.active) return null;
+  const n = rp.count > 1 ? ` (${rp.index + 1}/${rp.count})` : '';
+  return { t: `Playing ${rp.file}${n}  ` + (rp.phase === 'approach' ? 'moving to start...' : `${rp.t.toFixed(1)} / ${rp.duration.toFixed(1)} s`), c: '#4aa3ff', b: true };
+}
+
+// ---- per-frame work ------------------------------------------------------------------------
+function updateHud(head) {
+  const now = performance.now();
+  if (ar.note !== hud.userData.lastNote) { hud.userData.lastNote = ar.note; hud.userData.noteAt = now; }
+  // Hidden help panel: only a new message pops up, briefly. The menu shows the status while it is open.
+  const toast = !ar.hud && ar.note && now - (hud.userData.noteAt || 0) < TOAST_MS;
+  hud.visible = !ar.menuOpen && (ar.hud || toast);
+  if (!hud.visible) return;
+  head.getWorldPosition(_p); head.getWorldQuaternion(_q);
+  _f.set(0, 0, -1).applyQuaternion(_q); _f.y = 0; _f.normalize();
+  const want = _p.clone().addScaledVector(_f, 0.55); want.y -= 0.25;
+  hud.position.lerp(want, hud.userData.placed ? 0.08 : 1);
+  hud.userData.placed = true;
+  hud.lookAt(_p);
+  if (!ar.hud) { hud.userData.draw([{ t: ar.note, c: '#4aa3ff', b: true }, { t: 'Help panel hidden: X (controller) or Help shows it', c: '#8a8d99' }]); return; }
+  const L = [], H = handsActive();
+  if (ar.editing && ar.tuneMode) {
+    L.push({ t: 'Aligning: fine-tune', b: true, c: '#00e5ff' });
+    L.push('Pinch-drag: right hand slides, left hand (sideways) turns about the motor.');
+    L.push({ t: 'Wrist: Done = save + lock · Cancel = back to the saved alignment', c: '#8a8d99' });
+  } else if (ar.mode === 'grab') {
+    L.push({ t: 'Aligning: drop the glowing motor onto the real one', b: true, c: '#00e5ff' });
+    if (H) {
+      L.push(`Pinch the glowing ${ALIGN_MOTOR.name} motor, move it onto the REAL`);
+      L.push('motor, twist your wrist to turn it. Let go. Repeat until it matches.');
+      L.push({ t: 'Wrist: Done = save + lock · Cancel = undo · Tune = fine turns', c: '#8a8d99' });
+    } else {
+      L.push('Squeeze the grip at the glowing motor, move it onto the REAL');
+      L.push('motor, twist to turn it. Release. Repeat. Grip + sticks = fine-tune.');
+      L.push({ t: 'A = Done (save + lock) · X = Cancel (undo) · stick click = corners', c: '#8a8d99' });
+    }
+  } else if (ar.mode === 'calib') {
+    const k = ar.captured.length;
+    L.push({ t: `Align: touch point ${k + 1} of 2`, b: true, c: CAL_COLORS[k] });
+    if (H) {
+      L.push(`Press your right fingertip on the ${k ? 'magenta' : 'green'} corner of the`);
+      L.push('REAL base plate. Hold still ~1.5 s, or pinch with your left hand.');
+      L.push({ t: 'Wrist menu: Align = cancel', c: '#8a8d99' });
+    } else {
+      L.push(`Put the blue dot on the ${k ? 'magenta' : 'green'} corner of the REAL`);
+      L.push('base plate, where it meets the table. Pull trigger.');
+      L.push({ t: 'Thumbstick click = cancel', c: '#8a8d99' });
+    }
+  } else if (ar.restoring) {
+    L.push({ t: 'Looking for the saved alignment...', b: true });
+    L.push('Look around the robot for a moment.');
+  } else if (!ar.aligned) {
+    L.push({ t: 'Not aligned yet', b: true, c: '#ff9f1a' });
+    L.push(H ? '1. Pinch: drop the twin near the real base' : '1. Trigger: drop the twin near the real base');
+    L.push(H ? '2. Wrist bar > Align: move the glowing motor onto the real one' : `2. A: align by the ${ALIGN_MOTOR.name} motor`);
+    L.push({ t: H ? 'Wrist bar: poke with your right index finger' : 'Y: menu · B: hologram on/off · X: hide this panel', c: '#8a8d99' });
+  } else {
+    L.push({ t: 'Aligned and locked' + (ar.anchor ? (ar.persisted ? ' · saved for next time' : ' · this session only') : ''),
+             b: true, c: '#3ecf8e' });
+    if (H) {
+      L.push('Wrist bar: Menu (replay, realign) · Holo on/off · Labels · Help (hide this panel)');
+    } else {
+      L.push(`Y: menu (replay, realign) · B: hologram ${ar.holo ? 'on' : 'off'} · L-stick click: labels (${LABEL_MODES[labelMode]})`);
+      L.push({ t: state?.replay?.active ? 'A: STOP the replay · X: hide this panel' : 'X: hide this panel', c: '#8a8d99' });
+    }
+  }
+  const rl = replayLine();
+  if (rl) L.push(rl);
+  if (ar.note) L.push({ t: ar.note, c: '#4aa3ff' });
+  hud.userData.draw(L);
+}
+
+function arFrame(frame, dt) {
+  const session = renderer.xr.getSession();
+  const head = renderer.xr.getCamera();
+  const now = performance.now();
+  updateDrag(head);
+  updateDwell(now, head);
+  updateWristBar(head);
+  if (ar.menuOpen) arMenu.set(menuItems(now));
+  updatePanels(now);
+  updatePointer();
+  updateOverlays(head, now);
+  pollInputs(session, dt);
+  if (ar.anchorPending && !ar.editing) makeAnchor(frame);
+  if (ar.anchor && !ar.tuning && !ar.editing) {        // the anchor is the authority for where the robot is
+    const pose = frame.getPose(ar.anchor.anchorSpace, renderer.xr.getReferenceSpace());
+    if (pose) {
+      const { position: p, orientation: o } = pose.transform;
+      twinRoot.position.set(p.x, p.y, p.z);
+      twinRoot.quaternion.set(o.x, o.y, o.z, o.w);
+      if (ar.restoring) { ar.restoring = false; ar.aligned = true; ar.persisted = true; ar.quality = 'restored'; ar.note = 'Saved alignment restored.'; }
+    }
+  }
+  if (ar.restoring && performance.now() > ar.restoreUntil) {
+    ar.restoring = false; ar.restoreGen++;
+    if (ar.anchor && !ar.aligned) { try { ar.anchor.delete(); } catch {} ar.anchor = null; }
+    ar.note = 'Saved alignment not found: align again (A).';
+    ar.placeOnNextFrame = true;
+  }
+  if (ar.placeOnNextFrame && !ar.restoring && head.position.lengthSq() > 0) {
+    ar.placeOnNextFrame = false;
+    placeTwinAt(head, 0.5, 0.35);                      // twin 0.5 m ahead of you, 0.35 m below your eyes
+  }
+  for (const m of calMarkers) if (m.visible) m.userData.label.lookAt(head.getWorldPosition(_p));
+  updateHud(head);
+}
+
+// ---- session lifecycle ---------------------------------------------------------------------
+async function setupARButton() {
+  const btn = $('arBtn'), note = $('arNote');
+  const unavailable = (why) => { btn.disabled = true; btn.textContent = 'AR not available'; note.textContent = why; };
+  const port = location.port || (location.protocol === 'https:' ? '443' : '80');
+  if (!window.isSecureContext) return unavailable(
+    `WebXR needs https or http://localhost. On the Quest, run ./quest_connect.sh ${port} and open http://localhost:${port}.`);
+  if (!navigator.xr) return unavailable('This browser has no WebXR (open the page in the Quest Browser).');
+  let ok = false;
+  try { ok = await navigator.xr.isSessionSupported('immersive-ar'); } catch {}
+  if (!ok) return unavailable('This device does not support immersive AR (normal on a desktop browser).');
+  btn.disabled = false; btn.textContent = 'Enter AR';
+  note.textContent = 'In AR: Y (or the wrist bar) opens the AR menu: replay, hologram on/off, labels, realign. ' +
+                     'A help panel floats below your view. Press the Meta button to exit.';
+  btn.onclick = async () => {
+    if (renderer.xr.isPresenting) { renderer.xr.getSession().end(); return; }
+    try {
+      const session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['local-floor'],
+        optionalFeatures: ['hand-tracking', 'anchors', 'plane-detection', 'hit-test'],
+      });
+      await renderer.xr.setSession(session);
+    } catch (e) { say('Could not start AR: ' + e.message, true); }
+  };
+}
+
+renderer.xr.addEventListener('sessionstart', () => {
+  scene.background = null;                // transparent clear = passthrough
+  grid.visible = false;
+  renderer.xr.setFoveation?.(1);
+  const s = renderer.xr.getSession();
+  Object.assign(ar, { mode: 'free', aligned: false, captured: [], anchor: null, anchorPending: false,
+                      tuning: false, quality: '', note: '', placeOnNextFrame: true,
+                      tuneMode: false, drag: null, poke: { armed: false, until: 0 }, persisted: false,
+                      editing: false, editBackup: null, menuOpen: false, confirm: { id: null, until: 0 } });
+  Object.assign(ar.dwell, { pos: null, n: 0, armed: true, last: null });
+  wristBar.placed = false; arMenu.mesh.visible = false;
+  applyLook();
+  ar.buttons.clear();
+  hud.userData.placed = false;
+  tryRestoreAnchor(s);                    // if this succeeds, the robot comes back where you aligned it
+  $('arBtn').textContent = 'Exit AR';
+  console.log('[AR] session started, enabled features:', s.enabledFeatures);
+  say('AR session started');
+});
+renderer.xr.addEventListener('sessionend', () => {
+  scene.background = new THREE.Color(0x16171c);
+  grid.visible = true;
+  hud.visible = false; wristBar.mesh.visible = false; arMenu.mesh.visible = false; pointerDot.visible = false; dwellRing.visible = false;
+  ar.editing = false; ar.editBackup = null; ar.menuOpen = false;
+  setLiftGlow(false);
+  hideOverlays();
+  calMarkers.forEach(m => m.visible = false);
+  ar.anchor = null; ar.mode = 'free';
+  const keepHolo = ar.holo; ar.holo = true; applyLook(); ar.holo = keepHolo;   // desktop view always shows the arm
+  twinRoot.position.set(0, 0, 0); twinRoot.quaternion.identity();
+  $('arBtn').textContent = 'Enter AR';
+  resize();
+  say('AR session ended');
+});
+setupARButton();
+window.twinAR = { ar, CAL_PTS, hud, wristBar, arMenu, hands, liftCenter, arControllers, overlay, motion, labelModes: LABEL_MODES, getLabelMode: () => labelMode, getSample: () => ({ last: lastSample, t: lastSampleT, same: lastSample === state, cur: state && state.actual }) };   // handy in the devtools console (chrome://inspect)
+
 // ---------------------------------------------------------------- render loop
-renderer.setAnimationLoop(() => { orbit.update(); renderer.render(scene, camera); });
+let lastT = 0;
+renderer.setAnimationLoop((t, frame) => {
+  const dt = lastT ? Math.min((t - lastT) / 1000, 0.1) : 0;
+  lastT = t;
+  if (!renderer.xr.isPresenting) orbit.update();
+  renderer.render(scene, camera);
+  // The headset pose is written into the XR camera during render(), so AR work reads it afterwards.
+  if (renderer.xr.isPresenting && frame) arFrame(frame, dt);
+  else if (window.__overlayPreview) updateOverlays(camera, performance.now());   // debug: overlays on the desktop view
+});
 </script>
 </body>
 </html>
