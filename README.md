@@ -1,182 +1,156 @@
-# SO-101 Digital Twin & Teleoperation
+# SO-101 browser digital twin
 
-A research project exploring **leader-arm-free teleoperation** for the open-source [SO-101 robotic arm](https://github.com/TheRobotStudio/SO-ARM100). Instead of requiring a physical leader arm, the robot is controlled through a web-based 3D digital twin, keyboard controls, a knob-based GUI, or an XR headset (Meta Quest 3) via NVIDIA Isaac Teleop — all while supporting motion recording for dataset collection.
-
----
-
-## Features
-
-| Approach | Script | Input | Requires Display? |
-|---|---|---|---|
-| **Browser digital twin** | `so101_twin/twin_server.py` | Drag the 3D model in your browser | No (serves a web page) |
-| **Keyboard teleop** | `keyboard_teleop_so101.py` | Terminal keypresses (works over SSH) | No |
-| **Knob (dial) GUI** | `knob_teleop.py` | Tkinter speedometer dials + mouse | Yes (X11 / XWayland) |
-| **XR controller (Quest 3)** | `lerobot/run_xr_teleop.py` | Meta Quest 3 via NVIDIA Isaac Teleop | CloudXR runtime |
-
-All teleoperation methods write the same **JSON-lines recording format**, so `replay_motion.py` works with recordings from any of them.
-
----
-
-## Repository Structure
+Drag the 3D arm in your browser; the real SO-101 follows at a capped speed.
 
 ```
-ishaan_rnd/
-├── README.md                       # ← you are here
-├── environment.yml                 # conda environment (Python 3.12, lerobot, isaacteleop, etc.)
-│
-├── keyboard_teleop_so101.py        # terminal-based keyboard teleop (no GUI, SSH-friendly)
-├── knob_teleop.py                  # tkinter knob/dial GUI for joint-level control
-├── replay_motion.py                # replay a recorded .jsonl motion file on the robot
-│
-├── so101_twin/                     # browser-based 3D digital twin
-│   ├── twin_server.py              # Python HTTP server + 30 Hz control loop
-│   ├── twin_calib.json             # visual alignment offsets (twin ↔ real arm)
-│   ├── web/
-│   │   ├── index.html              # Three.js twin + control panel (single-file SPA)
-│   │   └── vendor/                 # three.js r160 + urdf-loader 0.13 (works offline)
-│   ├── urdf/
-│   │   ├── so101.urdf              # SO-101 URDF from TheRobotStudio/SO-ARM100
-│   │   └── assets/*.stl            # mesh files
-│   └── README.md                   # detailed twin-specific docs
-│
-└── lerobot/                        # LeRobot fork with Isaac Teleop integration
-    ├── run_xr_teleop.py            # quick-start script to bypass draccus CLI issues
-    ├── IsaacTeleop/                 # NVIDIA Isaac Teleop (cloned)
-    └── examples/
-        └── isaac_teleop_to_so101/  # XR controller → SO-101 example (teleop + record)
+so101_twin/
+  twin_server.py      # owns the serial bus, runs the 30 Hz speed-limited loop, serves the page
+  web/index.html      # Three.js twin + control panel
+  web/vendor/         # three.js 0.160 + urdf-loader 0.13 (works offline)
+  urdf/so101.urdf     # official so101_new_calib.urdf from TheRobotStudio/SO-ARM100
+  urdf/assets/*.stl   # its meshes
 ```
 
----
-
-## Setup
-
-### Prerequisites
-
-- Linux workstation
-- SO-101 follower arm, calibrated with `lerobot-calibrate`
-- (Optional) Meta Quest 3 or other CloudXR-capable headset for XR teleoperation
-
-### Environment
-
-The full conda environment is captured in `environment.yml`. To recreate it:
+## Run
 
 ```bash
-conda env create -f environment.yml
-conda activate ishaan_rnd
+cd ~/asherbot/so101_twin
+python twin_server.py --sim                                   # try it with no robot first
+python twin_server.py --port /dev/ttyACM0 --id asherbot       # real arm
+python twin_server.py --port /dev/ttyACM0 --id asherbot --max-speed 20
 ```
 
-Key dependencies include:
-- **[LeRobot](https://github.com/huggingface/lerobot)** `0.6.1` — robot control, calibration, dataset recording
-- **[isaacteleop](https://nvidia.github.io/IsaacTeleop)** `1.3.131` — NVIDIA Isaac Teleop (XR path)
-- **PyTorch**, **torchvision** — for LeRobot internals
-- **tkinter** — for the knob GUI (ships with most Python installs)
+Open http://127.0.0.1:8000. Run it from the same conda env as lerobot.
+Only the standard library is needed on top of lerobot.
 
----
+## Using it
 
-## Usage
+- **Solid arm** = where the motors actually are (read back every tick).
+- **Orange ghost** = target. Hover a part of the ghost: it lights up and shows the joint name.
+  Drag it to rotate that joint. The jaw drags the gripper.
+- Drag empty space to orbit, scroll to zoom. Side panel sliders give fine control.
+- **Space / STOP** freezes the target where the arm currently is. **Start pose** goes back to
+  the pose the arm had when the server started.
+- **Record** saves to `so101_twin/recorded_motions/<name>.jsonl` (leave the name blank for a
+  timestamped one). Same JSON-lines format as `teleop_and_record.py`, so `replay_motion.py` and
+  `block_trigger_watcher.py` work on these files unchanged.
+- **Replay…** lists everything in `recorded_motions/`. Click one or more files; they play in the
+  order you clicked them. Each file first moves to its starting pose, then plays in real time.
+  Replay obeys the max-speed slider: if a recording is faster than the cap, the replay slows down
+  (same path, longer duration) instead of moving faster. While replaying, dragging and sliders are
+  locked. **STOP / Space / Stop replay** ends it and hands control back. To replay old recordings,
+  copy their `.jsonl` files into `recorded_motions/`.
 
-### 1. Browser Digital Twin
+## Aligning the twin with the real arm
 
-The flagship approach — drag the 3D arm in your browser and the real robot follows at a safe, capped speed.
+LeRobot's 0 deg is whatever pose the arm held at the "middle of range" step of `lerobot-calibrate`.
+The URDF's 0 deg is its own "L" pose (upper arm vertical, forearm horizontal). They differ, so each
+joint needs `urdf_deg = sign * lerobot_deg + offset`. This lives in `twin_calib.json` and only
+changes the drawing, never the motors.
 
+The shipped file (shoulder_lift -90, elbow_flex +90) matches asherbot's folded rest pose.
+To redo it: click **Align twin to real arm**, the motors lock, then drag the twin or use the
++-90 buttons until it looks like the real arm, and **Save**.
+
+Then check direction: max speed ~10 deg/s, move one joint a little with its slider. If the twin turns
+the opposite way, open Align again and tick **flip** for that joint (the current pose is kept).
+
+## AR on a Meta Quest 3 (USB, Phase 0)
+
+The same page runs in the Quest Browser as a WebXR passthrough session. WebXR only works on
+https or `http://localhost`, so the Quest reaches this PC through `adb reverse` over a USB cable.
+Nothing goes over the network and the server stays bound to 127.0.0.1.
+
+One-time setup:
+1. Meta Horizon phone app: Devices -> your Quest 3 -> Headset settings -> Developer Mode ON
+   (needs a free Meta developer account). Reboot the headset.
+2. `sudo apt install adb`
+3. Connect the Quest to the PC with a data-capable USB-C cable, put it on, and accept
+   "Allow USB debugging" (tick "Always allow").
+
+Every session:
 ```bash
-# Try with a simulated (fake) arm first
-python so101_twin/twin_server.py --sim
-
-# Connect to the real arm
-python so101_twin/twin_server.py --port /dev/ttyACM0 --id asherbot
-
-# With a custom speed cap
-python so101_twin/twin_server.py --port /dev/ttyACM0 --id asherbot --max-speed 20
+python twin_server.py --sim                       # or --port /dev/ttyACM0 --id asherbot
+./quest_connect.sh                                # re-run after unplugging or rebooting the headset
 ```
+In the Quest Browser open `http://localhost:8000` and press **Enter AR**. The twin appears about
+0.5 m in front of you. Pull a trigger (or pinch) to put the robot's base where your controller tip is,
+with the arm facing the way the controller points. Press the Meta button to leave AR.
 
-Then open **http://127.0.0.1:8000** in a browser.
+Debugging: open Google Chrome on the PC at `chrome://inspect/#devices` to see the Quest page's console.
 
-- **Solid arm** = actual motor positions (read back every tick)
-- **Orange ghost** = target — drag it to move joints
-- **Space / STOP** = freeze in place, **Start pose** = return to initial pose
-- **Record** writes a `.jsonl` file compatible with `replay_motion.py`
+### Controls in AR
 
-See [`so101_twin/README.md`](so101_twin/README.md) for twin-specific docs (alignment, safety notes, etc.).
+A help panel floats just below your line of sight and always shows the next step.
 
-### 2. Keyboard Teleop
+| Controller | Hands (wrist bar above the LEFT wrist, poke with the right index finger) | Does |
+|---|---|---|
+| **Y** | **Menu** | Open / close the AR menu |
+| **B** | **Holo** | Hologram on / off. Labels and arcs stay, so a replay shows only the motor readings |
+| left stick click | **Labels** | Labels: all -> moving only -> off |
+| point + **trigger** | poke, or point a hand ray + pinch | Press a button on the AR menu |
+| | **STOP** (wrist bar, only while a replay runs) | Stop the replay |
 
-Minimal, SSH-friendly — no GUI needed.
+**The AR menu** opens in front of you: your recordings (tap files to select; they play in the order
+you tap, numbered), **Play**, a red **STOP**, speed **- / +**, **Hologram**, **Labels**, **Realign...**
+and **Forget...**. The status line at the bottom shows the replay in progress.
 
-```bash
-python keyboard_teleop_so101.py --port /dev/ttyACM0 --id asherbot
-```
+### Alignment is locked once saved
 
-| Keys | Joint |
-|------|-------|
-| `q` / `a` | Shoulder Pan +/− |
-| `w` / `s` | Shoulder Lift +/− |
-| `e` / `d` | Elbow Flex +/− |
-| `r` / `f` | Wrist Flex +/− |
-| `t` / `g` | Wrist Roll +/− |
-| `y` / `h` | Gripper +/− |
-| `x` | Quit |
+After aligning, nothing you do by accident can move the hologram: trigger, pinch, grip and sticks are
+ignored and the panel says "Alignment is locked". To change it:
 
-Each keypress moves the joint by 2° (configurable via `STEP_DEG`).
+1. Menu > **Realign...**, then tap it **again within 4 s** to confirm.
+2. You are now editing. The old alignment is kept, untouched, in the background.
+3. **Done** (A, or the wrist bar) saves the new alignment and locks it again.
+   **Cancel** (X, or the wrist bar) puts the hologram back exactly where the saved alignment was.
 
-### 3. Knob (Dial) GUI
+**Forget...** also needs a second tap. The first-ever alignment needs no unlock: A, or the wrist bar's
+**Align**, starts it directly.
 
-A Tkinter-based interface with speedometer-style dials for each joint.
+### Aligning (first time, or after Realign)
 
-```bash
-python knob_teleop.py --port /dev/ttyACM0 --id asherbot
-python knob_teleop.py --port /dev/ttyACM0 --id asherbot --max-speed 20
-```
+The twin is drawn from the robot's live joint angles, so its elbow-flex motor sits exactly where the real
+one does relative to the base. Put the hologram's motor on the real motor and the whole arm is aligned.
+(To use another motor, change `ALIGN_MOTOR` in web/index.html; the comment above it lists the
+shoulder-lift values.)
 
-- **White needle** = actual motor position
-- **Orange marker** = your target (drag the dial with the mouse)
-- **Grey dot** = position at startup
-- Adjustable max speed slider with hard ceiling of 90 °/s
-- Built-in recording to `.jsonl`
+1. Stand behind the robot so you can see the real elbow-flex motor. First time only: pull the trigger
+   (or pinch) near the robot to drop the hologram roughly in place.
+2. Start aligning (see above). The hologram's elbow motor glows cyan and the arm turns see-through.
+3. **Grab the glowing motor**: squeeze the grip with the controller on it, or pinch it. The hologram
+   follows your hand 1:1. Move it onto the real motor and twist to turn it. Let go. Repeat as needed.
+4. Fine-tune: controller = hold grip + sticks (right stick turns about the motor and raises/lowers, left
+   stick slides). Hands = wrist bar **Tune**, then pinch-drag (right hand slides, left hand sideways turns,
+   both at 1/3 scale).
+5. **Done** to save, or **Cancel** to undo.
 
-### 4. XR Teleoperation (Meta Quest 3 + Isaac Teleop)
+Controller-only alternative: while aligning, click the right thumbstick for the 2-corner method. Green
+**1** and magenta **2** mark the two front corners of the base plate; put the blue dot on each real corner
+and pull the trigger. The panel reports span error and height diff (under ~5 mm is good).
 
-Uses NVIDIA Isaac Teleop to map a Meta Quest 3 controller's grip pose to the SO-101 end-effector via Cartesian IK, with a squeeze-to-engage clutch.
+The saved alignment is a WebXR persistent anchor: the next AR session puts the hologram back by itself
+(look at the robot for a moment). Only one anchor is ever kept, so the Quest's per-site limit is never hit.
 
-```bash
-# From inside the lerobot/ directory:
-python run_xr_teleop.py
-```
+### Motor labels during motion (Phase 2)
 
-> **Note**: Edit `ROBOT_PORT` and `ROBOT_ID` in `run_xr_teleop.py` to match your setup.
+In AR every motor gets a floating label with its name and live angle. When a motor is engaged
+(turning faster than 3 deg/s, or more than 1.5 deg between two readings):
 
-For full documentation, installation steps, CloudXR setup, and dataset recording with XR, see [`lerobot/examples/isaac_teleop_to_so101/README.md`](lerobot/examples/isaac_teleop_to_so101/README.md).
+- its servo **glows orange** on the hologram and its label grows,
+- the label shows **Δ** (degrees moved since this motion started) and the current speed,
+- an **orange arc** at the joint sweeps from where the motion started to where the joint is now,
+- when it stops, the label keeps "moved +X" for 3 seconds, then shrinks back.
 
----
+The help panel also shows the replay in progress (file, n/N, time). Labels: **left thumbstick click**
+or wrist bar **Labels** cycles *all -> moving only -> off*. Tip: hologram off (B) plus labels gives pure
+annotations floating on the real arm.
 
-## Recording & Replay
+Speeds use the server's timestamp of each motor reading (`t` in `/api/state`), so Wi-Fi or frame-rate
+hiccups do not distort them.
 
-All teleoperation scripts can record motions as JSON-lines files (`.jsonl`). Each line contains:
+## Safety notes
 
-```json
-{"t": 0.033, "action": {"shoulder_pan.pos": 5.1, "shoulder_lift.pos": -2.2, ...}}
-```
-
-To replay a recorded motion on the robot:
-
-```bash
-python replay_motion.py --port /dev/ttyACM0 --id asherbot --file recording.jsonl
-```
-
-The replay includes a smooth ease-in from the arm's current position to the recording's first frame.
-
----
-
-## Safety Notes
-
-- The digital twin server binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only if you intentionally want other machines on the network to control the arm.
-- **Ctrl+C** disconnects from the robot, which releases motor torque (LeRobot default) — **support the arm before quitting**.
-- All teleoperation modes enforce a configurable speed ceiling (default 30 °/s, hard max 90 °/s) so the motors can never move faster than you intend.
-
----
-
-## Acknowledgements
-
-- [TheRobotStudio/SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100) — SO-101 hardware design & URDF
-- [Hugging Face LeRobot](https://github.com/huggingface/lerobot) — robot control framework & dataset tooling
-- [NVIDIA Isaac Teleop](https://github.com/NVIDIA/IsaacTeleop) — XR teleoperation framework
+- The server binds to 127.0.0.1 only. `--host 0.0.0.0` lets anyone on the network move the arm.
+- Ctrl+C disconnects, which releases torque (LeRobot default): support the arm first.
+- If the browser tab closes, the arm just holds its last target; nothing keeps moving.
