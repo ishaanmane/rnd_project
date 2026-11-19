@@ -76,6 +76,7 @@ SLOT_RE = re.compile(r"^(home|[1-9]\.(hover|grab))$")
 ARRIVE_TOL = 3.0       # deg: sequencer accepts a pose when every arm joint is this close
 ARRIVE_TIMEOUT = 3.0   # s: after the motion ends, wait at most this long for the arm to arrive
 GRIP_DWELL = 0.6       # s: wait after a gripper command (the block stops the jaw early)
+TORQUE_CHECK_S = 1.0   # s: while the arm is free, re-read Torque_Enable this often and fix it if it came back
 COLOR_RE = re.compile(r"^[a-z]{1,12}$")
 
 
@@ -224,6 +225,10 @@ class _SimBus:
     def enable_torque(self, motors=None, num_retry=0):
         self.sim.free -= set([motors] if isinstance(motors, str) else (motors or JOINTS))
 
+    def read(self, data_name, motor, **kw):
+        assert data_name == "Torque_Enable"
+        return 0 if motor in self.sim.free else 1
+
 
 class SimRobot:
     """Stand-in for SO101Follower: follows commands with a little lag."""
@@ -253,8 +258,9 @@ class SimRobot:
         return {f"{j}.pos": v for j, v in self.pos.items()}
 
     def send_action(self, action):
-        for j in JOINTS:
-            self.cmd[j] = float(action[f"{j}.pos"])
+        for j in JOINTS:                       # like lerobot: only the motors in the action get a goal
+            if f"{j}.pos" in action:
+                self.cmd[j] = float(action[f"{j}.pos"])
 
     def disconnect(self):
         pass
@@ -288,6 +294,7 @@ class Controller:
         self.board = {str(n): None for n in range(1, 10)}   # what is in each cell (twin + planner)
         self.holding = None    # colour of the block in the gripper, if any
         self.sort = None       # last plan from sorting.plan(), plus progress
+        self._torque_checked = 0.0
 
         # Read where the arm actually is BEFORE sending anything, so nothing jumps.
         obs = robot.get_observation()
@@ -446,15 +453,44 @@ class Controller:
             raise RuntimeError("this robot has no bus: cannot switch torque")
         (bus.enable_torque if on else bus.disable_torque)(ARM)
 
+    def _torque_on_motors(self):
+        """Arm motors whose Torque_Enable reads 1 (loop thread only). None if unreadable."""
+        bus = getattr(self.robot, "bus", None)
+        if bus is None or not hasattr(bus, "read"):
+            return None
+        return [j for j in ARM if int(bus.read("Torque_Enable", j)) != 0]
+
+    def _check_free(self):
+        """Loop thread, arm free: if any arm motor has torque again, switch it off again."""
+        try:
+            on = self._torque_on_motors()
+        except Exception as e:
+            with self.lock:
+                self.teach_msg = f"Could not read torque state: {e}"
+            return
+        if on:
+            self.robot.bus.disable_torque(on)
+            with self.lock:
+                self.teach_msg = "Torque came back on " + ", ".join(on) + ": switched off again."
+
     def _run_request(self, req, actual):
         """Loop thread only (it owns the serial bus)."""
         try:
             if req["kind"] == "free":
                 self._torque(False)
+                on = self._torque_on_motors()
+                if on:                              # one retry, then tell the user exactly which motor
+                    self.robot.bus.disable_torque(on)
+                    on = self._torque_on_motors()
                 with self.lock:
                     if self.teach is not None:
                         self.teach["free"] = True
-                    self.teach_msg = "Arm is free: hold it and move it by hand, then press Lock."
+                    self._torque_checked = time.perf_counter()
+                    if on:
+                        self.teach_msg = "Torque is still on for: " + ", ".join(on) + ". Tell Claude."
+                    else:
+                        checked = " (torque off confirmed on all 5 motors)" if on is not None else ""
+                        self.teach_msg = f"Arm is free{checked}: hold it and move it by hand, then press Lock."
                     req["result"] = (200, self.teach_msg)
             elif req["kind"] == "lock":
                 with self.lock:             # goal = where the arm is now, so torque-on causes no jump
@@ -809,8 +845,9 @@ class Controller:
                         self._replay_step(dt)
                     if self.program is not None:
                         self._program_tick(dt)
-                    if self.teach is not None and self.teach["free"]:
-                        for j in ARM:          # torque off: keep goal = where the hand put the arm
+                    arm_free = self.teach is not None and self.teach["free"]
+                    if arm_free:
+                        for j in ARM:          # torque off: remember where the hand put the arm
                             self.cmd[j] = self.target[j] = self.actual[j]
                     max_step = self.speed * dt
                     for j in JOINTS:
@@ -818,7 +855,9 @@ class Controller:
                         self.cmd[j] += max(-max_step, min(max_step, diff))
                     action = {f"{j}.pos": self.cmd[j] for j in JOINTS}
 
-                self.robot.send_action(action)
+                # While the arm is free, send a goal to the gripper only. A goal written to a
+                # torque-off STS3215 can switch its torque back on, which makes the arm stiff.
+                self.robot.send_action({"gripper.pos": action["gripper.pos"]} if arm_free else action)
                 obs = self.robot.get_observation()
                 actual = {j: float(obs[f"{j}.pos"]) for j in JOINTS}
 
@@ -832,6 +871,9 @@ class Controller:
                     jobs, self.requests = self.requests, []
                 for req in jobs:                   # torque on/off: only this thread touches the bus
                     self._run_request(req, actual)
+                if arm_free and not jobs and t0 - self._torque_checked > TORQUE_CHECK_S:
+                    self._torque_checked = t0
+                    self._check_free()
             except Exception as e:   # keep looping; surface the problem in the UI
                 with self.lock:
                     self.error = str(e)
