@@ -1,0 +1,26 @@
+{
+  "shoulder_pan": {
+    "sign": 1,
+    "offset": 0.0
+  },
+  "shoulder_lift": {
+    "sign": 1,
+    "offset": -108.36593406593407
+  },
+  "elbow_flex": {
+    "sign": 1,
+    "offset": 90.0
+  },
+  "wrist_flex": {
+    "sign": 1,
+    "offset": -12.635164835164858
+  },
+  "wrist_roll": {
+    "sign": 1,
+    "offset": 71.6
+  },
+  "gripper": {
+    "sign": 1,
+    "offset": 0.0
+  }
+}

@@ -152,53 +152,8 @@ annotations floating on the real arm.
 Speeds use the server's timestamp of each motor reading (`t` in `/api/state`), so Wi-Fi or frame-rate
 hiccups do not distort them.
 
-## Sorting demo
-
-Goal: 3 blocks of colour A in cells 1, 4, 7, 2 of colour B in cells 2, 8, 1 of colour C in cell 6.
-The colours are worked out from the counts (3 = A, 2 = B, 1 = C). Cells 3, 5 and 9 end empty and
-serve as parking cells. Planner: `sorting.py` (`python sorting.py test` checks every claim on all
-5040 start layouts, about 2 minutes).
-
-### 1. Teach the poses (once, and again whenever the sheet or the robot moves)
-
-Open **http://127.0.0.1:8001/teach** (or "Teach poses…" in the twin's Sorting panel).
-
-1. Press **Start teaching**. The gripper goes to its teach value (19.5 %) and stays there.
-2. Pick a slot (Home, then Cell 1 Hover, Cell 1 Grab, ...). After every save it moves on by itself.
-3. Put a block on the cell's dashed outline.
-4. **Hold the arm, then press Free arm (F).** All five arm motors lose torque; the gripper keeps it.
-   The arm drops if you let go.
-5. Move the arm by hand to the pose and press **Lock and save (L)**. Torque comes back where the arm
-   is (no jump) and the pose is saved to `taught_poses.json`.
-6. Hover: open jaws centred above the block, high enough to carry a block over the others.
-   Grab: jaws around the block at gripping height.
-7. **Test cell** runs hover, grab, hover (gripper untouched) so you can check each cell.
-
-STOP (or Space) while the arm is free = torque back on, nothing saved.
-Home has a default (your screenshot of 19 Nov 2026). Save your own if needed.
-Gripper values (teach, open, grip, home) can be changed on the same page without re-teaching.
-
-### 2. Run
-
-In the twin's **Sorting demo** panel: click cells to set the board, choose the algorithm, then
-**Plan** (shows the moves and why) or **Run**. Every move is:
-
-    pick:  hover -> grab -> gripper to 15 % -> hover
-    place: hover -> grab -> gripper to 19.5 % -> hover
-
-The run starts by opening the gripper and ends at Home (gripper 1 %). Every motion is speed-capped
-and moves all joints together along one straight line in joint space. STOP aborts at once.
-If a pose is not reached within 3 s (for example a collision), the run stops by itself.
-
-The twin draws the sheet, the blocks and the plan arrows (bright = next move). The sheet is placed
-from the taught grab poses; the panel shows the fit error in mm. More than about 10 mm means the
-teaching or the twin calibration is off.
-
 ## Safety notes
 
-- First runs: lower the max speed (10 to 20 °/s) and keep a hand on STOP.
-- The open value (19.5 %) leaves little room around a 25 mm block. If the jaws push blocks
-  while lowering, raise "Open" on the teach page. No re-teaching is needed.
 - The server binds to 127.0.0.1 only. `--host 0.0.0.0` lets anyone on the network move the arm.
 - Ctrl+C disconnects, which releases torque (LeRobot default): support the arm first.
 - If the browser tab closes, the arm just holds its last target; nothing keeps moving.

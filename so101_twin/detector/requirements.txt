@@ -1,0 +1,12 @@
+# Install PyTorch first (setup_env.sh does this):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Pins below follow the LocateAnything-3B model card.
+transformers==4.57.1
+opencv-python-headless==4.11.0.86
+numpy==1.25.0
+Pillow==11.1.0
+peft
+decord==0.6.0
+lmdb==1.7.5
+# grid sheet generator
+reportlab

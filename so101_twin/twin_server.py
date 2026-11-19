@@ -23,14 +23,6 @@ back (one or several in a row) through the same speed cap.
 Recording writes the same JSON-lines format as teleop_and_record.py /
 knob_teleop.py, so replay_motion.py and block_trigger_watcher.py still work.
 
-Sorting demo (see sorting.py and web/teach.html):
-    /teach.html   teach a hover and a grab pose for every cell by moving the arm by hand
-                  (arm torque off, gripper held at its teach value), plus the Home pose
-    sequencer     pick: hover -> grab -> close gripper -> hover
-                  place: hover -> grab -> open gripper -> hover; at the end: Home
-    Poses are saved in taught_poses.json. Every sequencer move runs through the
-    same speed cap, as one straight line in joint space (all joints arrive together).
-
 Only the standard library is needed (plus lerobot when not in --sim).
 """
 
@@ -41,8 +33,6 @@ import os
 import re
 import threading
 import time
-
-import sorting
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -62,53 +52,6 @@ RECORD_DIR = os.path.join(HERE, "recorded_motions")  # every recording goes here
 REPLAY_LAG_TOL = 2.0   # deg: replay clock pauses while cmd is further than this behind the recording
 SETTLE_TOL = 0.05      # deg: "cmd has reached the target"
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,99}\.jsonl")
-
-# ---- sorting demo ----------------------------------------------------------
-POSES_FILE = os.path.join(HERE, "taught_poses.json")
-ARM = JOINTS[:5]                       # everything except the gripper
-# Home pose from the demo screenshot of 19 Nov 2026. Re-teach it on the teach page if needed.
-DEFAULT_HOME = {"shoulder_pan": 1.2, "shoulder_lift": -1.3, "elbow_flex": 0.3,
-                "wrist_flex": -62.6, "wrist_roll": 18.3}
-# Gripper % values: teach = held while teaching, open = release / approach,
-# grip = close on a block, home = at the Home pose.
-DEFAULT_GRIPPER = {"teach": 19.5, "open": 19.5, "grip": 15.0, "home": 1.0}
-SLOT_RE = re.compile(r"^(home|[1-9]\.(hover|grab))$")
-ARRIVE_TOL = 3.0       # deg: sequencer accepts a pose when every arm joint is this close
-ARRIVE_TIMEOUT = 3.0   # s: after the motion ends, wait at most this long for the arm to arrive
-GRIP_DWELL = 0.6       # s: wait after a gripper command (the block stops the jaw early)
-COLOR_RE = re.compile(r"^[a-z]{1,12}$")
-
-
-def load_poses():
-    """taught_poses.json -> {"gripper", "home", "home_taught", "cells", "taught"} with defaults."""
-    try:
-        with open(POSES_FILE) as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    out = {"gripper": dict(DEFAULT_GRIPPER), "home": dict(DEFAULT_HOME), "home_taught": False,
-           "cells": {}, "taught": dict(data.get("taught") or {})}
-    for k, v in (data.get("gripper") or {}).items():
-        if k in DEFAULT_GRIPPER:
-            out["gripper"][k] = min(max(float(v), 0.0), 100.0)
-    home = data.get("home")
-    if isinstance(home, dict) and all(j in home for j in ARM):
-        out["home"] = {j: float(home[j]) for j in ARM}
-        out["home_taught"] = bool(data.get("home_taught", True))
-    for n in range(1, 10):
-        c = (data.get("cells") or {}).get(str(n)) or {}
-        for kind in ("hover", "grab"):
-            pose = c.get(kind)
-            if isinstance(pose, dict) and all(j in pose for j in ARM):
-                out["cells"].setdefault(str(n), {})[kind] = {j: float(pose[j]) for j in ARM}
-    return out
-
-
-def save_poses(poses):
-    tmp = POSES_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(poses, f, indent=1)
-    os.replace(tmp, POSES_FILE)      # atomic: a crash never leaves half a file
 
 
 def motion_path(name, default_if_empty=False):
@@ -212,19 +155,6 @@ def joint_limits(robot, joint):
     return -half, half
 
 
-class _SimBus:
-    """Torque on/off, like lerobot's FeetechMotorsBus.enable_torque / disable_torque."""
-
-    def __init__(self, sim):
-        self.sim = sim
-
-    def disable_torque(self, motors=None, num_retry=0):
-        self.sim.free |= set([motors] if isinstance(motors, str) else (motors or JOINTS))
-
-    def enable_torque(self, motors=None, num_retry=0):
-        self.sim.free -= set([motors] if isinstance(motors, str) else (motors or JOINTS))
-
-
 class SimRobot:
     """Stand-in for SO101Follower: follows commands with a little lag."""
 
@@ -234,22 +164,13 @@ class SimRobot:
         self.pos = {j: 0.0 for j in JOINTS}
         self.pos.update({"shoulder_pan": 5.1, "shoulder_lift": -2.2, "elbow_flex": 0.6, "wrist_flex": 90.5, "wrist_roll": 14.2, "gripper": 2.0})
         self.cmd = dict(self.pos)
-        self.free = set()                      # joints with torque off
-        self.bus = _SimBus(self)
 
     def connect(self):
         pass
 
-    def hand(self, values):
-        """--sim only: pretend a hand moved the free joints (for testing teach mode)."""
-        for j, v in values.items():
-            if j in self.free:
-                self.pos[j] = float(v)
-
     def get_observation(self):
         for j in JOINTS:                       # first-order lag, like a real servo
-            if j not in self.free:             # torque off: the joint stays where the hand left it
-                self.pos[j] += 0.35 * (self.cmd[j] - self.pos[j])
+            self.pos[j] += 0.35 * (self.cmd[j] - self.pos[j])
         return {f"{j}.pos": v for j, v in self.pos.items()}
 
     def send_action(self, action):
@@ -277,18 +198,6 @@ class Controller:
         self.replay_msg = ""   # last replay outcome, shown in the UI
         self.running = True
 
-        # sorting demo
-        self.poses = load_poses()
-        self.poses_version = 0
-        self.teach = None      # {"free": bool} while teach mode is on
-        self.teach_msg = ""
-        self.requests = []     # torque on/off jobs for the loop thread (it owns the bus)
-        self.program = None    # dict while the sequencer runs, see _start_program()
-        self.program_msg = ""
-        self.board = {str(n): None for n in range(1, 10)}   # what is in each cell (twin + planner)
-        self.holding = None    # colour of the block in the gripper, if any
-        self.sort = None       # last plan from sorting.plan(), plus progress
-
         # Read where the arm actually is BEFORE sending anything, so nothing jumps.
         obs = robot.get_observation()
         self.start_pose = {j: float(obs[f"{j}.pos"]) for j in JOINTS}
@@ -305,29 +214,16 @@ class Controller:
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
     # ---- commands from HTTP threads ---------------------------------------
-    def busy_reason(self):
-        """Why manual targets are refused right now, or '' if they are allowed. Lock held by caller."""
-        if self.replay is not None:
-            return "Replay in progress: press STOP to take control"
-        if self.program is not None:
-            return f"{self.program['name']} in progress: press STOP to take control"
-        if self.teach and self.teach["free"]:
-            return "Teach mode: the arm is free (torque off). Press Lock first"
-        return ""
-
     def set_targets(self, values):
-        """Returns '' if applied, else the reason it was refused (nothing changes then)."""
+        """Returns False (and changes nothing) while a replay owns the arm."""
         with self.lock:
-            why = self.busy_reason()
-            if why:
-                return why
+            if self.replay is not None:
+                return False
             for j, v in values.items():
                 if j in self.limits:
-                    if j == "gripper" and self.teach:      # the gripper is held while teaching
-                        continue
                     lo, hi = self.limits[j]
                     self.target[j] = min(max(float(v), lo), hi)
-            return ""
+            return True
 
     def set_speed(self, v):
         with self.lock:
@@ -338,332 +234,12 @@ class Controller:
             if self.replay is not None:
                 self.replay_msg = f"Replay of {self.replay['names'][self.replay['k']]} stopped"
             self.replay = None
-            if self.program is not None:
-                p = self.program
-                label = p["steps"][min(p["i"], len(p["steps"]) - 1)]["label"]
-                self.program_msg = f"{p['name']} stopped at: {label}"
-                self.program = None
             self.target = dict(self.cmd)
-            arm_free = bool(self.teach and self.teach["free"])
-        if arm_free:                               # STOP while teaching = torque back on, nothing saved
-            self._request("lock", wait=False)
 
     def go_start(self):
         with self.lock:
-            if self.busy_reason():
-                return False
+            self.replay = None
             self.target = dict(self.start_pose)
-            return True
-
-    # ---- teach mode (sorting demo) -------------------------------------------
-    def _request(self, kind, wait=True, **kw):
-        """Queue a torque job for the loop thread; optionally wait for its result."""
-        req = {"kind": kind, "event": threading.Event(), "result": (500, "no answer from the control loop"), **kw}
-        with self.lock:
-            self.requests.append(req)
-        if wait:
-            req["event"].wait(timeout=3.0)
-        return req["result"]
-
-    def teach_start(self):
-        with self.lock:
-            if self.replay is not None or self.program is not None or self.rec_file is not None:
-                return 409, "Stop the replay, program or recording first."
-            if self.teach is None:
-                self.teach = {"free": False}
-            self.target["gripper"] = self.poses["gripper"]["teach"]
-            self.teach_msg = "Teach mode on. Gripper held at %.1f %%." % self.poses["gripper"]["teach"]
-            return 200, self.teach_msg
-
-    def teach_stop(self):
-        with self.lock:
-            if self.teach is None:
-                return 200, "Teach mode is already off."
-            free = self.teach["free"]
-        if free:
-            code, msg = self._request("lock")
-            if code != 200:
-                return code, msg
-        with self.lock:
-            self.teach = None
-            self.teach_msg = "Teach mode off."
-            return 200, self.teach_msg
-
-    def teach_free(self):
-        with self.lock:
-            if self.teach is None:
-                return 409, "Turn teach mode on first."
-            if self.program is not None:
-                return 409, "Wait for the motion to finish (or press STOP)."
-            if self.teach["free"]:
-                return 200, "The arm is already free."
-        return self._request("free")
-
-    def teach_lock(self, slot):
-        if slot and not SLOT_RE.fullmatch(slot):
-            return 400, f"Unknown pose slot {slot!r}"
-        with self.lock:
-            if self.teach is None:
-                return 409, "Turn teach mode on first."
-            if self.program is not None:
-                return 409, "Wait for the motion to finish (or press STOP)."
-        return self._request("lock", slot=slot or None)
-
-    def _save_slot(self, slot, pose):
-        """Lock held by caller."""
-        pose = {j: round(pose[j], 2) for j in ARM}
-        if slot == "home":
-            self.poses["home"] = pose
-            self.poses["home_taught"] = True
-        else:
-            n, kind = slot.split(".")
-            self.poses["cells"].setdefault(n, {})[kind] = pose
-        self.poses["taught"][slot] = time.strftime("%Y-%m-%d %H:%M:%S")
-        save_poses(self.poses)
-        self.poses_version += 1
-
-    def set_gripper_values(self, body):
-        with self.lock:
-            for k in DEFAULT_GRIPPER:
-                if k in body:
-                    self.poses["gripper"][k] = min(max(float(body[k]), 0.0), 100.0)
-            save_poses(self.poses)
-            self.poses_version += 1
-            if self.teach and self.program is None:
-                self.target["gripper"] = self.poses["gripper"]["teach"]
-            return dict(self.poses["gripper"])
-
-    def slot_pose(self, slot):
-        """Lock held by caller."""
-        if slot == "home":
-            return self.poses["home"]
-        n, kind = slot.split(".")
-        return (self.poses["cells"].get(n) or {}).get(kind)
-
-    def _torque(self, on):
-        bus = getattr(self.robot, "bus", None)
-        if bus is None:
-            raise RuntimeError("this robot has no bus: cannot switch torque")
-        (bus.enable_torque if on else bus.disable_torque)(ARM)
-
-    def _run_request(self, req, actual):
-        """Loop thread only (it owns the serial bus)."""
-        try:
-            if req["kind"] == "free":
-                self._torque(False)
-                with self.lock:
-                    if self.teach is not None:
-                        self.teach["free"] = True
-                    self.teach_msg = "Arm is free: hold it and move it by hand, then press Lock."
-                    req["result"] = (200, self.teach_msg)
-            elif req["kind"] == "lock":
-                with self.lock:             # goal = where the arm is now, so torque-on causes no jump
-                    for j in ARM:
-                        self.cmd[j] = self.target[j] = actual[j]
-                    action = {f"{j}.pos": self.cmd[j] for j in JOINTS}
-                self.robot.send_action(action)
-                self._torque(True)
-                with self.lock:
-                    if self.teach is not None:
-                        self.teach["free"] = False
-                    slot = req.get("slot")
-                    if slot:
-                        self._save_slot(slot, actual)
-                        self.teach_msg = f"Saved {slot}: " + ", ".join(f"{actual[j]:.1f}" for j in ARM)
-                    else:
-                        self.teach_msg = "Arm locked (torque on). Nothing saved."
-                    req["result"] = (200, self.teach_msg)
-        except Exception as e:
-            req["result"] = (500, f"{req['kind']} failed: {e}")
-            with self.lock:
-                self.error = str(e)
-        finally:
-            req["event"].set()
-
-    # ---- sequencer (sorting demo) -----------------------------------------------
-    def _arm(self, pose, label):
-        return {"do": "arm", "pose": dict(pose), "label": label}
-
-    def _grip(self, value, label):
-        return {"do": "grip", "value": float(value), "label": label}
-
-    def _event(self, event, label, **kw):
-        return {"do": "event", "event": event, "label": label, **kw}
-
-    def _need(self, slots):
-        """Lock held by caller. Returns the list of missing pose slots."""
-        return [s for s in slots if not self.slot_pose(s)]
-
-    def _move_steps(self, n, src, dst):
-        """One block from src to dst. Lock held by caller."""
-        c, g = self.poses["cells"], self.poses["gripper"]
-        hs, gs = c[str(src)]["hover"], c[str(src)]["grab"]
-        hd, gd = c[str(dst)]["hover"], c[str(dst)]["grab"]
-        tag = f"Move {n}: " if n else ""
-        return [
-            self._event("move", f"{tag}cell {src} to cell {dst}", n=n, src=src, dst=dst),
-            self._arm(hs, f"{tag}hover over cell {src}"),
-            self._arm(gs, f"{tag}lower to the block in cell {src}"),
-            self._grip(g["grip"], f"{tag}close gripper ({g['grip']:.1f} %)"),
-            self._event("pick", f"{tag}picked", cell=src),
-            self._arm(hs, f"{tag}lift back over cell {src}"),
-            self._arm(hd, f"{tag}hover over cell {dst}"),
-            self._arm(gd, f"{tag}lower into cell {dst}"),
-            self._grip(g["open"], f"{tag}open gripper ({g['open']:.1f} %)"),
-            self._event("place", f"{tag}placed", cell=dst),
-            self._arm(hd, f"{tag}lift back over cell {dst}"),
-        ]
-
-    def _start_program(self, name, steps, allow_teach=False):
-        """Lock held by caller. Returns (code, msg)."""
-        if self.replay is not None or self.program is not None:
-            return 409, "Something is already moving: wait or press STOP."
-        if self.rec_file is not None:
-            return 409, "Stop recording first."
-        if self.teach is not None and (self.teach["free"] or not allow_teach):
-            return 409, ("Lock the arm first." if self.teach["free"] else "Leave teach mode first.")
-        self.program = {"name": name, "steps": steps, "i": 0, "move": None}
-        self.program_msg = ""
-        return 200, f"{name}: {len(steps)} steps"
-
-    def run_moves(self, moves, name):
-        """moves: [(src, dst), ...]. Opens the gripper, does the moves, ends at Home."""
-        with self.lock:
-            slots = ["home"] + [f"{c}.{k}" for m in moves for c in m for k in ("hover", "grab")]
-            missing = sorted(set(self._need(slots)))
-            if missing:
-                return 409, "Teach these poses first: " + ", ".join(missing)
-            g = self.poses["gripper"]
-            steps = [self._grip(g["open"], f"open gripper ({g['open']:.1f} %)")]
-            for n, (src, dst) in enumerate(moves, 1):
-                steps += self._move_steps(n if len(moves) > 1 else 0, src, dst)
-            steps += [self._arm(self.poses["home"], "return to Home"),
-                      self._grip(g["home"], f"gripper to {g['home']:.1f} % at Home")]
-            return self._start_program(name, steps)
-
-    def go_home(self):
-        with self.lock:
-            return self._start_program("Go Home", [self._arm(self.poses["home"], "move to Home")],
-                                       allow_teach=True)
-
-    def goto_slot(self, slot):
-        if not SLOT_RE.fullmatch(slot or ""):
-            return 400, f"Unknown pose slot {slot!r}"
-        with self.lock:
-            pose = self.slot_pose(slot)
-            if not pose:
-                return 409, f"{slot} is not taught yet."
-            return self._start_program(f"Go to {slot}", [self._arm(pose, f"move to {slot}")], allow_teach=True)
-
-    def test_cell(self, n):
-        """hover -> grab -> hover, gripper untouched. For checking taught poses."""
-        with self.lock:
-            missing = self._need([f"{n}.hover", f"{n}.grab"])
-            if missing:
-                return 409, "Teach these poses first: " + ", ".join(missing)
-            c = self.poses["cells"][str(n)]
-            steps = [self._arm(c["hover"], f"hover over cell {n}"),
-                     self._arm(c["grab"], f"lower to grab height in cell {n}"),
-                     self._arm(c["hover"], f"back over cell {n}")]
-            return self._start_program(f"Test cell {n}", steps, allow_teach=True)
-
-    def set_board(self, cells):
-        clean = {str(n): None for n in range(1, 10)}
-        for k, v in (cells or {}).items():
-            if str(k) not in clean:
-                raise ValueError(f"cell {k} does not exist")
-            if v:
-                v = str(v).strip().lower()
-                if not COLOR_RE.fullmatch(v):
-                    raise ValueError(f"bad colour name {v!r}")
-                clean[str(k)] = v
-        with self.lock:
-            if self.program is not None:
-                raise ValueError("The board cannot change while the robot is moving.")
-            self.board = clean
-            self.holding = None
-            self.sort = None
-        return clean
-
-    def make_plan(self, algorithm):
-        with self.lock:
-            board = dict(self.board)
-        p = sorting.plan(board, algorithm)        # raises sorting.PlanError with a readable message
-        p["current"] = None
-        p["done"] = 0
-        with self.lock:
-            self.sort = p
-        return p
-
-    def run_sort(self, algorithm):
-        p = self.make_plan(algorithm)
-        if not p["moves"]:
-            return 200, "Already sorted: nothing to do.", p
-        code, msg = self.run_moves([(m["src"], m["dst"]) for m in p["moves"]], f"Sort ({p['algorithm_name']})")
-        return code, msg, p
-
-    def _program_tick(self, dt):
-        """Inside the control loop, lock held: advance the sequencer."""
-        p = self.program
-        while p["i"] < len(p["steps"]):
-            st = p["steps"][p["i"]]
-            if st["do"] == "event":           # instant: update the board, then go on
-                ev = st["event"]
-                if ev == "move":
-                    p["move"] = st["n"] or None
-                    if self.sort is not None and st["n"]:
-                        self.sort["current"] = st["n"]
-                elif ev == "pick":
-                    self.holding = self.board.get(str(st["cell"])) or "block"
-                    self.board[str(st["cell"])] = None
-                elif ev == "place":
-                    self.board[str(st["cell"])] = self.holding
-                    self.holding = None
-                    if self.sort is not None and p["move"]:
-                        self.sort["done"] = p["move"]
-                p["i"] += 1
-                continue
-            if "_t" not in st:                 # first tick of this step
-                st["_t"] = 0.0
-                if st["do"] == "arm":
-                    st["_from"] = {j: self.cmd[j] for j in ARM}
-                    span = max(abs(st["pose"][j] - self.cmd[j]) for j in ARM)
-                    st["_T"] = span / max(self.speed, 1e-3)
-                else:
-                    self.target["gripper"] = st["value"]
-            st["_t"] += dt
-            if st["do"] == "arm":
-                T = st["_T"]
-                s = 1.0 if T <= 0 else min(st["_t"] / T, 1.0)
-                for j in ARM:                  # straight line in joint space: all joints arrive together
-                    self.target[j] = st["_from"][j] + s * (st["pose"][j] - st["_from"][j])
-                if s < 1.0 or max(abs(self.target[j] - self.cmd[j]) for j in ARM) > SETTLE_TOL:
-                    return
-                err = max(abs(self.actual[j] - st["pose"][j]) for j in ARM)
-                if err > ARRIVE_TOL:
-                    if st["_t"] - T > ARRIVE_TIMEOUT:
-                        self.program_msg = (f"{p['name']} stopped: the arm did not reach "
-                                            f"'{st['label']}' ({err:.1f} deg off). Check for a collision.")
-                        self.program = None
-                        self.target = dict(self.cmd)
-                    return
-            else:
-                if abs(self.cmd["gripper"] - st["value"]) > SETTLE_TOL:
-                    st["_t"] = 0.0             # dwell counts from when the command arrives
-                    return
-                if st["_t"] < GRIP_DWELL:
-                    return
-            p["i"] += 1
-        self.program_msg = f"{p['name']} finished."
-        self.program = None
-
-    def _program_status(self):
-        p = self.program
-        if p is None:
-            return {"active": False, "msg": self.program_msg}
-        st = p["steps"][min(p["i"], len(p["steps"]) - 1)]
-        return {"active": True, "name": p["name"], "step": p["i"] + 1, "count": len(p["steps"]),
-                "label": st["label"], "move": p["move"]}
 
     def start_recording(self, name, overwrite):
         try:
@@ -702,8 +278,6 @@ class Controller:
         with self.lock:
             if self.rec_file is not None:
                 return 400, "Stop recording before replaying."
-            if self.program is not None or self.teach is not None:
-                return 409, "Leave teach mode / stop the running program before replaying."
             self.replay = {"names": names, "motions": motions, "k": 0,
                            "phase": "approach", "clock": 0.0, "i": 0}
             self.replay_msg = ""
@@ -772,12 +346,6 @@ class Controller:
                 "rec_path": self.rec_path,
                 "replay": self._replay_status(),
                 "error": self.error,
-                "teach": None if self.teach is None else {"free": self.teach["free"], "msg": self.teach_msg},
-                "program": self._program_status(),
-                "board": dict(self.board),
-                "holding": self.holding,
-                "sort": self.sort,
-                "poses_version": self.poses_version,
             }
 
     def config(self):
@@ -788,13 +356,7 @@ class Controller:
             "speed_ceiling": SPEED_CEILING,
             "loop_hz": LOOP_HZ,
             "twin_calib": load_twin_calib(),
-            "algorithms": sorting.ALGORITHMS,
-            "targets": {k: list(v) for k, v in sorting.DEFAULT_TARGETS.items()},
         }
-
-    def poses_info(self):
-        with self.lock:
-            return {"version": self.poses_version, **self.poses}
 
     # ---- control loop -----------------------------------------------------
     def _loop(self):
@@ -807,11 +369,6 @@ class Controller:
                 with self.lock:
                     if self.replay is not None:
                         self._replay_step(dt)
-                    if self.program is not None:
-                        self._program_tick(dt)
-                    if self.teach is not None and self.teach["free"]:
-                        for j in ARM:          # torque off: keep goal = where the hand put the arm
-                            self.cmd[j] = self.target[j] = self.actual[j]
                     max_step = self.speed * dt
                     for j in JOINTS:
                         diff = self.target[j] - self.cmd[j]
@@ -829,9 +386,6 @@ class Controller:
                     if self.rec_file is not None:
                         entry = {"t": t0 - self.rec_t0, "action": action}
                         self.rec_file.write(json.dumps(entry) + "\n")
-                    jobs, self.requests = self.requests, []
-                for req in jobs:                   # torque on/off: only this thread touches the bus
-                    self._run_request(req, actual)
             except Exception as e:   # keep looping; surface the problem in the UI
                 with self.lock:
                     self.error = str(e)
@@ -862,11 +416,6 @@ def make_handler(ctrl):
             self.end_headers()
             self.wfile.write(body)
 
-        @staticmethod
-        def _cm(result):
-            code, msg = result
-            return code, {"msg": msg}
-
         def _file(self, root, rel):
             path = os.path.realpath(os.path.join(root, rel))
             if not path.startswith(os.path.realpath(root) + os.sep) or not os.path.isfile(path):
@@ -889,10 +438,6 @@ def make_handler(ctrl):
                 return self._json(200, ctrl.config())
             if p == "/api/recordings":
                 return self._json(200, {"files": list_motions()})
-            if p == "/api/poses":
-                return self._json(200, ctrl.poses_info())
-            if p == "/teach":
-                return self._file(WEB_ROOT, "teach.html")
             if p.startswith("/urdf/"):
                 return self._file(URDF_ROOT, p[len("/urdf/"):])
             return self._file(WEB_ROOT, "index.html" if p == "/" else p.lstrip("/"))
@@ -906,9 +451,8 @@ def make_handler(ctrl):
                 return self._json(400, {"msg": "bad json"})
 
             if p == "/api/target":
-                why = ctrl.set_targets(body)
-                if why:
-                    return self._json(409, {"msg": why})
+                if not ctrl.set_targets(body):
+                    return self._json(409, {"msg": "Replay in progress: press STOP to take control"})
                 return self._json(200, {"ok": True})
             if p == "/api/speed":
                 ctrl.set_speed(body.get("speed", DEFAULT_SPEED))
@@ -917,8 +461,7 @@ def make_handler(ctrl):
                 ctrl.stop()
                 return self._json(200, {"msg": "Stopped (target = current command)"})
             if p == "/api/go_start":
-                if not ctrl.go_start():
-                    return self._json(409, {"msg": "Busy (replay, program or free arm): press STOP first"})
+                ctrl.go_start()
                 return self._json(200, {"msg": "Returning to start pose"})
             if p == "/api/record/start":
                 code, msg, name = ctrl.start_recording(body.get("file", ""), bool(body.get("overwrite")))
@@ -934,60 +477,6 @@ def make_handler(ctrl):
             if p == "/api/replay/stop":
                 ctrl.stop()
                 return self._json(200, {"msg": "Replay stopped"})
-            # ---- sorting demo: teaching --------------------------------------
-            if p == "/api/teach/start":
-                return self._json(*self._cm(ctrl.teach_start()))
-            if p == "/api/teach/stop":
-                return self._json(*self._cm(ctrl.teach_stop()))
-            if p == "/api/teach/free":
-                return self._json(*self._cm(ctrl.teach_free()))
-            if p == "/api/teach/lock":
-                code, msg = ctrl.teach_lock(body.get("slot") or "")
-                return self._json(code, {"msg": msg, "poses": ctrl.poses_info()})
-            if p == "/api/teach/goto":
-                return self._json(*self._cm(ctrl.goto_slot(str(body.get("slot", "")))))
-            if p == "/api/teach/test_cell":
-                try:
-                    n = int(body.get("cell"))
-                    assert 1 <= n <= 9
-                except (TypeError, ValueError, AssertionError):
-                    return self._json(400, {"msg": "cell must be 1 to 9"})
-                return self._json(*self._cm(ctrl.test_cell(n)))
-            if p == "/api/poses/gripper":
-                try:
-                    return self._json(200, {"msg": "saved", "gripper": ctrl.set_gripper_values(body)})
-                except (TypeError, ValueError) as e:
-                    return self._json(400, {"msg": str(e)})
-            if p == "/api/go_home":
-                return self._json(*self._cm(ctrl.go_home()))
-            if p == "/api/sim/hand":                 # --sim only: pretend to move the free arm by hand
-                if not isinstance(ctrl.robot, SimRobot):
-                    return self._json(404, {"msg": "only with --sim"})
-                ctrl.robot.hand({k: v for k, v in body.items() if k in JOINTS})
-                return self._json(200, {"ok": True})
-            # ---- sorting demo: board, plan, run ---------------------------------
-            if p == "/api/board":
-                try:
-                    return self._json(200, {"board": ctrl.set_board(body.get("cells"))})
-                except (ValueError, TypeError, AttributeError) as e:
-                    return self._json(400, {"msg": str(e)})
-            if p in ("/api/sort/plan", "/api/sort/run"):
-                alg = str(body.get("algorithm") or "astar")
-                try:
-                    if p == "/api/sort/plan":
-                        plan = ctrl.make_plan(alg)
-                        return self._json(200, {"msg": plan["summary"]["text"], "plan": plan})
-                    code, msg, plan = ctrl.run_sort(alg)
-                    return self._json(code, {"msg": msg, "plan": plan})
-                except sorting.PlanError as e:
-                    return self._json(400, {"msg": str(e)})
-            if p == "/api/sort/move":
-                try:
-                    src, dst = int(body.get("src")), int(body.get("dst"))
-                    assert 1 <= src <= 9 and 1 <= dst <= 9 and src != dst
-                except (TypeError, ValueError, AssertionError):
-                    return self._json(400, {"msg": "src and dst must be different cells 1 to 9"})
-                return self._json(*self._cm(ctrl.run_moves([(src, dst)], f"Move cell {src} to {dst}")))
             if p == "/api/twin_calib":
                 try:
                     save_twin_calib(body)
