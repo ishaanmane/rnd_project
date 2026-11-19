@@ -20,7 +20,7 @@ from locate_service import SCAN_DIR, print_summary, run_scan
 from sheet_layout import BLOCK_SIZE, MARKER_DICT, MARKER_SIZE, PAGE_H, PAGE_W, Layout
 
 TEX = 4.0   # texture px per mm
-CUBE_BGR = {"red": (40, 40, 205), "green": (70, 160, 40), "blue": (190, 90, 20), "yellow": (30, 200, 235)}
+CUBE_BGR = {"black": (38, 38, 38), "red": (40, 40, 205), "green": (70, 160, 40), "blue": (190, 90, 20), "yellow": (30, 200, 235)}
 
 
 def sheet_texture(L):
@@ -107,6 +107,11 @@ def scenarios(L):
         ("from the side, 30 deg, rotated", (cx - 300, cy + 150, -480),
          [("red", c[8]), ("green", j(1, 6, -5)), ("blue", c[3]), ("yellow", j(5, -8, 8))]),
         ("close, 35 deg", (cx + 120, cy + 300, -380), [("red", c[9]), ("green", c[4]), ("blue", c[2])]),
+        # sorting demo: 3 + 2 + 1 blocks, same colours side by side
+        ("demo 3 blue 2 black 1 yellow", (cx, cy + 120, -500),
+         [("blue", c[1]), ("blue", c[2]), ("blue", c[5]), ("black", c[3]), ("black", c[6]), ("yellow", c[7])]),
+        ("demo, two blacks adjacent", (cx - 80, cy + 200, -480),
+         [("blue", c[4]), ("blue", c[8]), ("blue", c[9]), ("black", c[1]), ("black", c[2]), ("yellow", c[6])]),
     ]
 
 
@@ -118,17 +123,21 @@ def main():
     ap.add_argument("--save", action="store_true")
     a = ap.parse_args()
     L = Layout(a.cell)
-    backend = make_backend(a.backend, model=a.model)
+    from locate_service import MODEL_REVISION
+    backend = make_backend(a.backend, model=a.model, revision=MODEL_REVISION)
     fails = 0
     for k, (name, eye, cubes) in enumerate(scenarios(L)):
         img = render(L, cubes, eye, seed=k)
         if a.save:
             os.makedirs(SCAN_DIR, exist_ok=True)
             cv2.imwrite(os.path.join(SCAN_DIR, f"selftest_{k}.jpg"), img)
-        res = run_scan(img, backend, [c for c, _ in cubes], save=a.save)
+        expect = {}
+        for col, _ in cubes:
+            expect[col] = expect.get(col, 0) + 1
+        res = run_scan(img, backend, sorted(expect), save=a.save, expect=expect)
         want = {str(L.locate(*p)[0]): col for col, p in cubes}
         got = {n: col for n, col in (res.get("cells") or {}).items() if col}
-        ok = res["ok"] and got == want
+        ok = res["ok"] and got == want and res.get("counts_ok", False)
         fails += not ok
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         if not ok:

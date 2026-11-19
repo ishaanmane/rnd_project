@@ -28,11 +28,16 @@ HUE_RANGES = {
     "pink": [(161, 169)],
 }
 SAT_MIN, VAL_MIN = 90, 60
+DARK_MAX = 85          # "black": brightness below this, any saturation
 BLOCK_MM = 25.0
 
 
 def measured_color(img_bgr, box=None, point=None, names=None):
-    """Name the dominant saturated hue inside a box (or around a point)."""
+    """Name the dominant colour inside a box (or around a point).
+
+    Saturated pixels give a hue name. If few pixels are saturated but most
+    are dark, the answer is "black". Otherwise None (unsure).
+    """
     h, w = img_bgr.shape[:2]
     if box is not None:
         x1, y1, x2, y2 = [int(round(v)) for v in box]
@@ -47,6 +52,9 @@ def measured_color(img_bgr, box=None, point=None, names=None):
     hsv = cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2HSV).reshape(-1, 3)
     sat = hsv[(hsv[:, 1] >= SAT_MIN) & (hsv[:, 2] >= VAL_MIN)]
     if len(sat) < 0.15 * len(hsv):
+        dark = int((hsv[:, 2] < DARK_MAX).sum())
+        if dark >= 0.4 * len(hsv) and (not names or "black" in names):
+            return "black"
         return None
     best, count = None, 0
     for name, ranges in HUE_RANGES.items():
@@ -70,12 +78,17 @@ class ColorBackend:
         amin, amax = 0.25 * side * side, 3.0 * side * side
         out = []
         for color in colors:
-            if color not in HUE_RANGES:
+            if color not in HUE_RANGES and color != "black":
                 continue
             mask = np.zeros(hsv.shape[:2], np.uint8)
-            for lo, hi in HUE_RANGES[color]:
-                mask |= cv2.inRange(hsv, (lo, SAT_MIN, VAL_MIN), (hi, 255, 255))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            if color == "black":
+                # dark pixels; the opening below removes thin grid lines and digits
+                mask |= cv2.inRange(hsv, (0, 0, 0), (179, 255, DARK_MAX - 1))
+            else:
+                for lo, hi in HUE_RANGES[color]:
+                    mask |= cv2.inRange(hsv, (lo, SAT_MIN, VAL_MIN), (hi, 255, 255))
+            k = 9 if color == "black" else 5
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
             n, _, stats, cent = cv2.connectedComponentsWithStats(mask)
             for i in range(1, n):
@@ -118,7 +131,7 @@ class LocateAnythingBackend:
     DETECT = "Locate all the instances that matches the following description: {phrase}."
     POINT = "Point to: {phrase}."
 
-    def __init__(self, model="nvidia/LocateAnything-3B", phrase="{color} cube", mode="detect",
+    def __init__(self, model="nvidia/LocateAnything-3B", revision=None, phrase="{color} cube", mode="detect",
                  greedy=False, temperature=0.7, max_new_tokens=1024, generation_mode="hybrid", **_):
         import torch
         from transformers import AutoModel, AutoProcessor, AutoTokenizer
@@ -131,13 +144,16 @@ class LocateAnythingBackend:
         if self.device == "cpu":
             print("[locate] WARNING: no CUDA GPU found, running on CPU (very slow)")
         t = time.time()
-        self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-        self.processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(model, torch_dtype=self.dtype,
-                                               trust_remote_code=True).to(self.device).eval()
+        # revision pins both the weights and the model's own Python code files
+        pin = {"revision": revision} if revision else {}
+        self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True, **pin)
+        self.processor = AutoProcessor.from_pretrained(model, trust_remote_code=True, **pin)
+        self.model = AutoModel.from_pretrained(model, dtype=self.dtype, trust_remote_code=True,
+                                               **pin).to(self.device).eval()
         self.lock = threading.Lock()
         self.ready = True
-        print(f"[locate] model loaded on {self.device} in {time.time() - t:.1f} s")
+        print(f"[locate] model loaded on {self.device} in {time.time() - t:.1f} s "
+              f"(revision {revision or 'latest'})")
         if self.device == "cuda":
             print(f"[locate] GPU memory in use: {torch.cuda.memory_allocated() / 2**30:.1f} GB")
 

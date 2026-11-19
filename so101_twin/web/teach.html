@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teach Poses</title>
+<style>
+  :root { --bg:#16171c; --panel:#1f2027; --panel2:#272832; --fg:#e8e9ee; --dim:#9a9caa; --accent:#4fa3ff;
+          --ok:#3ecf8e; --warn:#f0b54a; --danger:#e5484d; --line:#2c2e37; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px; }
+  header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; flex:1; }
+  a { color: var(--accent); }
+  .conn { color:var(--dim); font-size:12px; display:flex; align-items:center; gap:6px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#555; } .dot.on { background:var(--ok); }
+  button { background:var(--panel2); color:var(--fg); border:1px solid #3a3c46; border-radius:8px; padding:9px 14px;
+           font:inherit; cursor:pointer; }
+  button:hover:not(:disabled) { border-color:#5a5d6a; }
+  button:disabled { opacity:.4; cursor:default; }
+  button.stop { background:var(--danger); border-color:var(--danger); font-weight:700; letter-spacing:.5px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#06121f; font-weight:700; }
+  button.big { font-size:17px; padding:16px 18px; font-weight:700; }
+  button.free { background:#3b2f12; border-color:var(--warn); color:var(--warn); }
+  button.lock { background:#103324; border-color:var(--ok); color:var(--ok); }
+  .grid2 { display:grid; grid-template-columns: 1.35fr 1fr; gap:16px; margin-top:14px; }
+  @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); }
+  .slotname { font-size:26px; font-weight:700; }
+  .slotname small { font-size:14px; color:var(--dim); font-weight:400; margin-left:8px; }
+  .howto { color:var(--dim); margin:6px 0 14px; min-height:42px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > button { flex:1; }
+  .armstate { display:inline-block; padding:4px 10px; border-radius:6px; font-weight:700; font-size:13px; }
+  .armstate.free { background:#3b2f12; color:var(--warn); }
+  .armstate.locked { background:#103324; color:var(--ok); }
+  .armstate.off { background:var(--panel2); color:var(--dim); }
+  .cells { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .cell { border:1px solid var(--line); border-radius:8px; padding:8px; background:var(--panel2); }
+  .cell .n { font-weight:700; margin-bottom:6px; }
+  .slot { display:flex; justify-content:space-between; align-items:center; padding:5px 8px; border-radius:6px;
+          cursor:pointer; font-size:13px; border:1px solid transparent; }
+  .slot:hover { border-color:#3a3c46; }
+  .slot.cur { border-color:var(--accent); background:#1d2a40; }
+  .tick { font-size:11px; color:var(--dim); }
+  .slot.done .tick { color:var(--ok); }
+  .homeslot { margin-bottom:8px; background:var(--panel2); border:1px solid var(--line); border-radius:8px; }
+  .robotside { text-align:center; color:var(--dim); font-size:11px; letter-spacing:.1em; margin-top:6px; }
+  table.j { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  table.j td { padding:3px 0; } table.j td:last-child { text-align:right; }
+  .gv { display:grid; grid-template-columns: 1fr 80px; gap:6px 10px; align-items:center; }
+  .gv input { background:var(--bg); color:var(--fg); border:1px solid #3a3c46; border-radius:6px; padding:5px 7px; font:inherit; width:80px; }
+  #msg { margin-top:12px; min-height:20px; color:var(--dim); }
+  #msg.err { color:var(--danger); }
+  .keys { color:var(--dim); font-size:12px; margin-top:10px; }
+  kbd { background:var(--panel2); border:1px solid #3a3c46; border-radius:4px; padding:0 5px; font:12px ui-monospace, monospace; }
+  ol { margin:6px 0 0; padding-left:18px; color:var(--dim); } ol li { margin:3px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Teach Poses</h1>
+    <a href="/">Back to the twin</a>
+    <span class="conn"><span class="dot" id="dot"></span><span id="conntxt">offline</span></span>
+    <button class="stop" id="stop" title="Space">STOP</button>
+  </header>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <span class="armstate off" id="armstate">Teach mode off</span>
+        <button id="teachBtn" class="primary" style="flex:0 0 auto">Start teaching</button>
+      </div>
+      <div style="margin-top:16px" class="slotname" id="slotname">Home</div>
+      <div class="howto" id="howto"></div>
+      <div class="row">
+        <button class="big free" id="freeBtn" title="F">Free arm</button>
+        <button class="big lock" id="lockBtn" title="L">Lock and save</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="prevBtn" title="P or Left arrow">Previous</button>
+        <button id="nextBtn" title="N or Right arrow">Next</button>
+        <button id="gotoBtn">Go to saved pose</button>
+        <button id="testBtn">Test cell</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="lockOnly">Lock without saving</button>
+        <button id="homeBtn">Go Home</button>
+      </div>
+      <div id="msg"></div>
+      <div class="keys"><kbd>F</kbd> free arm &nbsp; <kbd>L</kbd> lock and save &nbsp; <kbd>N</kbd>/<kbd>P</kbd> next / previous &nbsp; <kbd>Space</kbd> STOP</div>
+    </div>
+
+    <div class="card">
+      <h2>Poses</h2>
+      <div class="homeslot"><div class="slot" data-slot="home"><span>Home</span><span class="tick" id="tick-home"></span></div></div>
+      <div class="cells" id="cells"></div>
+      <div class="robotside">ROBOT SIDE</div>
+    </div>
+
+    <div class="card">
+      <h2>Live joints</h2>
+      <table class="j" id="joints"></table>
+    </div>
+
+    <div class="card">
+      <h2>Gripper values (%)</h2>
+      <div class="gv">
+        <label for="g-teach">Held while teaching</label><input id="g-teach" type="number" step="0.5" min="0" max="100">
+        <label for="g-open">Open (approach and release)</label><input id="g-open" type="number" step="0.5" min="0" max="100">
+        <label for="g-grip">Grip (close on a block)</label><input id="g-grip" type="number" step="0.5" min="0" max="100">
+        <label for="g-home">At Home</label><input id="g-home" type="number" step="0.5" min="0" max="100">
+      </div>
+      <div class="row" style="margin-top:10px"><button id="gSave">Save gripper values</button></div>
+      <h2 style="margin-top:16px">How to teach a cell</h2>
+      <ol>
+        <li>Put a block on the cell's dashed outline.</li>
+        <li><b>Hold the arm</b>, then press Free arm. With the torque off, the arm drops if you let go.</li>
+        <li>Hover: put the open jaws centred above the block, high enough to carry a block over the others. Press Lock and save.</li>
+        <li>Grab: press Free arm, lower the jaws around the block to the height you want to grip, then Lock and save.</li>
+        <li>Press Test cell to watch the robot go hover, grab, hover.</li>
+      </ol>
+    </div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+const SLOTS = ['home'];
+for (let n = 1; n <= 9; n++) SLOTS.push(n + '.hover', n + '.grab');
+let cur = 0, poses = null, posesVersion = -1, state = null, online = false;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data };
+}
+function say(m, err = false) { $('msg').textContent = m || ''; $('msg').classList.toggle('err', !!err); }
+function slotLabel(s) {
+  if (s === 'home') return ['Home', ''];
+  const [n, k] = s.split('.');
+  return [`Cell ${n}`, k === 'hover' ? 'Hover' : 'Grab'];
+}
+function poseOf(s) {
+  if (!poses) return null;
+  if (s === 'home') return poses.home;
+  const [n, k] = s.split('.');
+  return poses.cells?.[n]?.[k] || null;
+}
+function isTaught(s) { return s === 'home' ? !!poses?.home_taught : !!poseOf(s); }
+
+function buildCells() {
+  const box = $('cells');
+  for (let n = 1; n <= 9; n++) {
+    const c = document.createElement('div'); c.className = 'cell';
+    c.innerHTML = `<div class="n">${n}</div>` + ['hover', 'grab'].map(k =>
+      `<div class="slot" data-slot="${n}.${k}"><span>${k === 'hover' ? 'Hover' : 'Grab'}</span><span class="tick" id="tick-${n}-${k}"></span></div>`).join('');
+    box.appendChild(c);
+  }
+  document.querySelectorAll('.slot').forEach(el => el.onclick = () => { cur = SLOTS.indexOf(el.dataset.slot); render(); });
+}
+const HOWTO = {
+  home: 'The pose the robot starts from and returns to. Fold the arm into your demo rest pose, then Lock and save. (A default from your screenshot is used until you save one.)',
+  hover: 'Open jaws centred above the block, high enough to carry a block over the others.',
+  grab: 'Jaws around the block at the height you want to grip. The gripper stays at the teach value, do not move it.',
+};
+function render() {
+  const s = SLOTS[cur];
+  const [a, b] = slotLabel(s);
+  $('slotname').innerHTML = a + (b ? `<small>${b}</small>` : '');
+  $('howto').textContent = s === 'home' ? HOWTO.home : HOWTO[s.split('.')[1]];
+  document.querySelectorAll('.slot').forEach(el => el.classList.toggle('cur', el.dataset.slot === s));
+  for (const sl of SLOTS) {
+    const id = sl === 'home' ? 'tick-home' : `tick-${sl.replace('.', '-')}`;
+    const el = $(id); if (!el) continue;
+    const t = poses?.taught?.[sl];
+    el.textContent = isTaught(sl) ? 'saved' + (t ? ' ' + t.slice(11, 16) : '') : (sl === 'home' ? 'default' : 'not yet');
+    el.parentElement.classList.toggle('done', isTaught(sl));
+  }
+  const teach = state?.teach, busy = !!state?.program?.active;
+  $('armstate').className = 'armstate ' + (!teach ? 'off' : teach.free ? 'free' : 'locked');
+  $('armstate').textContent = !teach ? 'Teach mode off' : teach.free ? 'ARM FREE (torque off)' : 'Arm locked (torque on)';
+  $('teachBtn').textContent = teach ? 'Finish teaching' : 'Start teaching';
+  $('freeBtn').disabled = !teach || teach.free || busy;
+  $('lockBtn').disabled = !teach || busy;
+  $('lockOnly').disabled = !teach || !teach.free || busy;
+  $('gotoBtn').disabled = !teach || teach.free || busy || !poseOf(s);
+  const n = s === 'home' ? null : s.split('.')[0];
+  $('testBtn').disabled = !teach || teach.free || busy || !n || !poseOf(n + '.hover') || !poseOf(n + '.grab');
+  $('testBtn').textContent = n ? `Test cell ${n}` : 'Test cell';
+  $('homeBtn').disabled = (teach && teach.free) || busy;
+}
+function fillGripper() {
+  for (const k of ['teach', 'open', 'grip', 'home']) {
+    const el = $('g-' + k); if (document.activeElement !== el) el.value = poses.gripper[k];
+  }
+}
+async function loadPoses() { const r = await api('/api/poses'); poses = r.data; posesVersion = poses.version; fillGripper(); render(); }
+
+async function doFree() { if ($('freeBtn').disabled) return; const r = await api('/api/teach/free', {}); say(r.data.msg, !r.ok); }
+async function doLock() {
+  if ($('lockBtn').disabled) return;
+  const s = SLOTS[cur];
+  const r = await api('/api/teach/lock', { slot: s });
+  say(r.data.msg, !r.ok);
+  if (r.ok) { poses = r.data.poses; posesVersion = poses.version; if (cur < SLOTS.length - 1) cur++; render(); }
+}
+async function doStop() { const r = await api('/api/stop', {}); say(r.data.msg); }
+
+$('teachBtn').onclick = async () => {
+  const r = await api(state?.teach ? '/api/teach/stop' : '/api/teach/start', {});
+  say(r.data.msg, !r.ok);
+};
+$('freeBtn').onclick = doFree;
+$('lockBtn').onclick = doLock;
+$('lockOnly').onclick = async () => { const r = await api('/api/teach/lock', {}); say(r.data.msg, !r.ok); };
+$('prevBtn').onclick = () => { cur = Math.max(0, cur - 1); render(); };
+$('nextBtn').onclick = () => { cur = Math.min(SLOTS.length - 1, cur + 1); render(); };
+$('gotoBtn').onclick = async () => { const r = await api('/api/teach/goto', { slot: SLOTS[cur] }); say(r.data.msg, !r.ok); };
+$('testBtn').onclick = async () => { const r = await api('/api/teach/test_cell', { cell: +SLOTS[cur].split('.')[0] }); say(r.data.msg, !r.ok); };
+$('homeBtn').onclick = async () => { const r = await api('/api/go_home', {}); say(r.data.msg, !r.ok); };
+$('stop').onclick = doStop;
+$('gSave').onclick = async () => {
+  const body = {}; for (const k of ['teach', 'open', 'grip', 'home']) body[k] = +$('g-' + k).value;
+  const r = await api('/api/poses/gripper', body); say(r.ok ? 'Gripper values saved.' : r.data.msg, !r.ok);
+  if (r.ok) loadPoses();
+};
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === ' ') { e.preventDefault(); doStop(); }
+  else if (k === 'f') doFree();
+  else if (k === 'l') doLock();
+  else if (k === 'n' || k === 'arrowright') $('nextBtn').click();
+  else if (k === 'p' || k === 'arrowleft') $('prevBtn').click();
+});
+
+let lastProg = '';
+async function poll() {
+  try {
+    const r = await api('/api/state'); state = r.data;
+    if (!online) { online = true; $('dot').classList.add('on'); $('conntxt').textContent = 'live'; }
+    $('joints').innerHTML = JOINTS.map(j => `<tr><td>${j.replace('_', ' ')}</td><td>${state.actual[j].toFixed(1)}${j === 'gripper' ? ' %' : ' °'}</td></tr>`).join('');
+    if (state.poses_version !== posesVersion) await loadPoses();
+    const p = state.program;
+    const pm = p.active ? `${p.name}: ${p.label} (${p.step}/${p.count})` : p.msg;
+    if (pm && pm !== lastProg) say(pm);
+    lastProg = pm || '';
+    if (state.error) say('Robot error: ' + state.error, true);
+    render();
+  } catch {
+    online = false; $('dot').classList.remove('on'); $('conntxt').textContent = 'offline';
+  }
+  setTimeout(poll, 100);
+}
+buildCells();
+loadPoses().then(poll);
+</script>
+</body>
+</html>
