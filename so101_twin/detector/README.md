@@ -61,14 +61,41 @@ python locate_service.py --backend color            # fallback without the model
 Every scan saves the photo, the top-down image, the annotated image and the
 JSON result in `scans/`.
 
-Useful options: `--colors red,green,blue,yellow`, `--phrase "{color} block"`,
-`--mode point` (point queries instead of boxes), `--greedy` (repeatable answers).
+Useful options: `--colors red,black,blue,yellow`, `--expect blue:3,black:2,yellow:1`,
+`--phrase "{color} block"`, `--mode point` (point queries instead of boxes),
+`--greedy` (no sampling).
+
+## Several blocks of one colour
+
+Normal and supported. Give the expected counts and the answer says whether
+they match (`counts`, `counts_ok`, plus a warning such as "expected 3 blue, found 2"):
+
+```bash
+python locate_service.py --expect blue:3,black:2,yellow:1
+```
+
+The test page has an "Expected" field for the same thing.
+
+## Pinned model version
+
+The detector loads LocateAnything-3B at commit
+`c32291ca5e996f5a7a485845b4f57a233936bba0`, the version tested on 19 Nov 2026.
+The pin covers the weights and the model's own Python code, so an update on
+Hugging Face cannot change behaviour before the demo. `--revision latest`
+uses the newest version instead.
+
+For the demo day, run fully offline so a slow network cannot delay start-up:
+
+```bash
+export HF_HUB_OFFLINE=1
+python locate_service.py --expect blue:3,black:2,yellow:1
+```
 
 ## API
 
 `POST /api/detect` with either
-- the raw JPEG/PNG as the body (`Content-Type: image/jpeg`), optional `?colors=red,blue`, or
-- JSON `{"image": "<base64 or data URL>", "colors": ["red", "blue"]}`.
+- the raw JPEG/PNG as the body (`Content-Type: image/jpeg`), optional `?colors=red,blue&expect=blue:3,black:2`, or
+- JSON `{"image": "<base64 or data URL>", "colors": ["red", "blue"], "expect": {"blue": 3, "black": 2}}`.
 
 Answer (short form):
 
