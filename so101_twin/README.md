@@ -89,6 +89,7 @@ A help panel floats just below your line of sight and always shows the next step
 | **B** | **Holo** | Hologram on / off. Labels and arcs stay, so a replay shows only the motor readings |
 | left stick click | **Labels** | Labels: all -> moving only -> off |
 | point + **trigger** | poke, or point a hand ray + pinch | Press a button on the AR menu |
+| point at the **bar under a menu** + hold trigger | **pinch the bar** (or point + pinch) and move | Move the menu. It turns to face you and stays where you let go (remembered next to the robot for next time) |
 | **A** (while the robot moves) | **STOP** (wrist bar, only while the robot moves) | Stop the replay or the sort |
 | **X** (when not aligning) | **Help** | Hide / show the help panel (remembered). While hidden, a new message still pops up for 4 s |
 
@@ -202,6 +203,12 @@ blocks, and each detected block gets a coloured outline on the real grid. The ne
 an orange ring (pick), a green ring (place) and an arrow; a banner beyond the far edge of the grid
 says the move and why. Check the outlines, then press **Run**. STOP: the panel, A, or the wrist bar.
 A scan is refused unless it finds 3 green + 2 + 1 blocks (then rescan).
+
+**Camera button** (top of the Sort panel): "Camera: auto" picks a camera that faces the world
+("facing back"). The Quest names its cameras like "camera 0, facing front", "camera 1, facing back",
+"camera 2, facing back"; the name is the device, it does not change with where you look. Pressing
+the button cycles through the cameras the browser offers and back to auto; the choice is remembered.
+The line under the scan result shows which camera took the photo and its resolution.
 
 **On the PC:** set the board by clicking cells, or **Scan photo…** (for example a phone photo
 taken from above), then **Plan** (shows the moves and why) or **Run**. Every move is:

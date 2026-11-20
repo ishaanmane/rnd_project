@@ -249,7 +249,8 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import URDFLoader from 'urdf-loader';
 import { PointerURDFDragControls } from 'urdf-drag';
 import { initSorting } from '/board.js';
-import { cameraSupported, allowCamera, cameraPermission, captureJPEG } from '/questcam.js';
+import { cameraSupported, allowCamera, cameraPermission, captureJPEG, listCameras,
+         preferredCamera, setPreferredCamera, shortName } from '/questcam.js';
 
 const JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
 const UNIT = j => j === 'gripper' ? '%' : '°';
@@ -817,6 +818,9 @@ const ar = {
   openOnStart: false,                 // show the homepage on the first AR frame
   holoBeforeSort: null,               // hologram state to restore when leaving the Sort screen
   scanBusy: false, camNote: '',       // Scan with the Quest camera
+  cams: [],                           // cameras the browser offers (for the Camera button)
+  panelDrag: null,                    // a menu being moved by its bar: {panel, ctrl|hand, offset}
+  menuSpot: null,                     // where you last put a menu: {frame: 'robot'|'world', p: [x,y,z]}
 };
 try { ar.holo = localStorage.getItem('so101-twin-holo') !== '0'; } catch {}
 try { ar.hud = localStorage.getItem('so101-twin-help') !== '0'; } catch {}
@@ -1241,7 +1245,12 @@ const arControllers = [0, 1].map(i => {
                              new THREE.LineBasicMaterial({ color: 0x4aa3ff, transparent: true, opacity: 0.8, depthTest: false }));
   ray.renderOrder = 25; ray.visible = false;
   c.add(ray); c.userData.ray = ray;                 // shown only while pointing at a menu
-  c.addEventListener('select', () => onSelect(c));
+  c.addEventListener('select', () => {
+    if (c.userData.skipSelect) { c.userData.skipSelect = false; return; }   // that press moved a menu
+    onSelect(c);
+  });
+  c.addEventListener('selectstart', () => startPanelDragRay(c));
+  c.addEventListener('selectend', () => { if (ar.panelDrag?.ctrl === c) endPanelDrag(); });
   c.addEventListener('squeezestart', () => { if (ar.mode === 'grab' && !c.userData.isHand) beginGrab({ ctrl: c }); });
   c.addEventListener('squeezeend', () => { if (ar.drag?.src?.ctrl === c) endGrab(); });
   c.addEventListener('disconnected', () => { c.userData.connected = false; c.userData.hover = null; ray.visible = false; });
@@ -1358,6 +1367,7 @@ function touchPoint(h, out = new THREE.Vector3()) {
 }
 
 function onPinchStart(h) {
+  if (startPanelDragPinch(h)) return;
   const hd = h.userData.handedness;
   if (arControllers.some(c => c.userData.handedness === hd && c.userData.hover)) return;   // it's a menu press
   if (ar.mode === 'grab') { if (!ar.drag) beginGrab({ hand: h }); return; }
@@ -1378,6 +1388,7 @@ function onPinchStart(h) {
   }
 }
 function onPinchEnd(h) {                                    // pollInputs then saves the pose
+  if (ar.panelDrag?.hand === h) return endPanelDrag();
   if (ar.drag?.src?.hand === h) return endGrab();
   if (ar.drag?.h === h) ar.drag = null;
 }
@@ -1519,13 +1530,16 @@ function updatePanels(now) {
     }
   }
   for (const c of arControllers) {                         // 2) point a controller / hand ray at it
-    c.userData.hover = null;
+    c.userData.hover = null; c.userData.hoverBar = null;
     const ray = c.userData.ray;
     if (!vis.length || !c.userData.connected) { if (ray) ray.visible = false; continue; }
     c.getWorldPosition(_t); c.getWorldQuaternion(_q);
     raycaster.set(_t, new THREE.Vector3(0, 0, -1).applyQuaternion(_q));
-    const hits = raycaster.intersectObjects(vis.map(p => p.mesh), false);
-    if (hits.length && hits[0].distance > 0.06) {         // closer than 6 cm: that is a poke, not pointing
+    const hits = raycaster.intersectObjects(vis.flatMap(p => (p.bar ? [p.mesh, p.bar] : [p.mesh])), false);
+    if (hits.length && hits[0].object.userData.isMoveBar) {   // pointing at a menu's move bar
+      c.userData.hoverBar = hits[0].object.userData.panel;
+      ray.visible = true; ray.scale.z = hits[0].distance;
+    } else if (hits.length && hits[0].distance > 0.06) {  // closer than 6 cm: that is a poke, not pointing
       const hit = hits[0], p = hit.object.userData.panel;
       const b = p.buttonAt(p.mesh.worldToLocal(hit.point.clone()));
       c.userData.hover = { p, b };
@@ -1589,19 +1603,108 @@ const sortPanel = new ARPanel(SORT_W, SORT_H, { px: 3000 });
 panels.push(sortPanel);
 const menuPanels = () => [homePanel, arMenu, sortPanel];
 function screenPanel(s = ar.screen) { return s === 'settings' ? arMenu : s === 'sort' ? sortPanel : homePanel; }
+
+// ---- moving a menu: the bar under it, like a browser window's bar -------------------------------
+// Pinch the bar (or point at it and hold the trigger / pinch), move, let go. The menu turns to face
+// you. Where you leave it is remembered relative to the robot, so it comes back there next time.
+const BAR_W = 0.16, BAR_H = 0.03, BAR_REACH = 0.025;
+function makeMoveBar(panel) {
+  const cv = document.createElement('canvas'); cv.width = 480; cv.height = 90;
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const bar = new THREE.Mesh(new THREE.PlaneGeometry(BAR_W, BAR_H), new THREE.MeshBasicMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }));
+  bar.renderOrder = 25;
+  bar.position.set(0, -panel.h / 2 - BAR_H / 2 - 0.004, 0);
+  bar.userData = { panel, cv, tex, state: '', isMoveBar: true };
+  panel.mesh.add(bar);
+  panel.bar = bar;
+  drawBar(bar, 'idle');
+}
+function drawBar(bar, state) {
+  if (bar.userData.state === state) return;
+  bar.userData.state = state;
+  const g = bar.userData.cv.getContext('2d'), W = 480, H = 90;
+  g.clearRect(0, 0, W, H);
+  g.fillStyle = state === 'drag' ? '#4aa3ff' : state === 'hover' ? '#ffffff' : 'rgba(200,203,212,0.7)';
+  g.beginPath(); g.roundRect(W * 0.2, H * 0.32, W * 0.6, H * 0.36, H * 0.18); g.fill();
+  bar.userData.tex.needsUpdate = true;
+}
+[homePanel, arMenu, sortPanel].forEach(makeMoveBar);
+
+function barUnder(point) {                         // the visible move bar this point is pinching, if any
+  if (!point) return null;
+  for (const p of menuPanels()) {
+    if (!p.mesh.visible) continue;
+    const l = p.bar.worldToLocal(point.clone());
+    if (Math.abs(l.x) < BAR_W / 2 + BAR_REACH && Math.abs(l.y) < BAR_H / 2 + BAR_REACH && Math.abs(l.z) < 0.05) return p;
+  }
+  return null;
+}
+function startPanelDragRay(c) {
+  const panel = c.userData.hoverBar;
+  if (ar.panelDrag || !panel) return;
+  c.updateMatrixWorld(true);
+  ar.panelDrag = { panel, ctrl: c, offset: c.worldToLocal(panel.mesh.position.clone()) };
+  c.userData.skipSelect = true;
+}
+function startPanelDragPinch(h) {
+  if (ar.panelDrag) return false;
+  const at = pinchPos(h);
+  const panel = barUnder(at);
+  if (!panel) return false;
+  ar.panelDrag = { panel, hand: h, offset: panel.mesh.position.clone().sub(at) };
+  for (const c of arControllers) if (c.userData.handedness === h.userData.handedness) c.userData.skipSelect = true;
+  return true;
+}
+function endPanelDrag() {
+  const d = ar.panelDrag;
+  ar.panelDrag = null;
+  if (!d) return;
+  const pos = d.panel.mesh.position;
+  if (ar.aligned) {                                 // remember it next to the robot, also for next time
+    const local = twinRoot.worldToLocal(pos.clone()).toArray();
+    ar.menuSpot = { frame: 'robot', p: local };
+    store.set('so101-twin-menu', JSON.stringify(local));
+  } else {
+    ar.menuSpot = { frame: 'world', p: pos.toArray() };
+  }
+}
+function menuSpotWorld() {
+  const s = ar.menuSpot;
+  if (!s) return null;
+  if (s.frame === 'robot') return ar.aligned ? twinRoot.localToWorld(new THREE.Vector3().fromArray(s.p)) : null;
+  return new THREE.Vector3().fromArray(s.p);
+}
+function updatePanelDrag(head) {
+  const d = ar.panelDrag;
+  if (d) {
+    const m = d.panel.mesh;
+    if (d.ctrl) m.position.copy(d.ctrl.localToWorld(d.offset.clone()));
+    else { const at = pinchPos(d.hand, _t); if (at) m.position.copy(at).add(d.offset); }
+    m.lookAt(head.getWorldPosition(_p));
+  }
+  const near = [hands.left, hands.right].map(h => barUnder(h ? pinchPos(h) : null));
+  for (const p of menuPanels()) {
+    drawBar(p.bar, d?.panel === p ? 'drag'
+      : (arControllers.some(c => c.userData.hoverBar === p) || near.includes(p)) ? 'hover' : 'idle');
+  }
+}
 function openMenu() {
   const head = renderer.xr.getCamera();
   head.getWorldPosition(_p); head.getWorldQuaternion(_q);
   _f.set(0, 0, -1).applyQuaternion(_q); _f.y = 0; _f.normalize();
   _f.applyAxisAngle(_up, 0.55);                             // ~30 deg to your LEFT, so the robot ahead stays visible
   const m = screenPanel().mesh;
-  m.position.copy(_p).addScaledVector(_f, 0.45); m.position.y -= 0.15;   // arm's reach, a bit low
+  const spot = menuSpotWorld();                             // where you last put a menu, if anywhere
+  if (spot) m.position.copy(spot);
+  else { m.position.copy(_p).addScaledVector(_f, 0.45); m.position.y -= 0.15; }   // arm's reach, a bit low
   m.lookAt(_p);
   m.visible = true; ar.menuOpen = true;
   if (ar.screen === 'settings') loadRecordings();
 }
 function closeMenu() { for (const p of menuPanels()) p.mesh.visible = false; ar.menuOpen = false; ar.confirm.id = null; }
 function enterSort() {                                      // hologram off while sorting (B still toggles it)
+  refreshCams();
   ar.holoBeforeSort = ar.holo;
   if (ar.holo) { ar.holo = false; applyLook(); }
   sortingUI?.refreshVisibility();
@@ -1631,7 +1734,7 @@ function homeItems() {
   I.push({ btn: true, id: 'goSort', label: 'Sort', x: 0.015, y: 0.04, w: 0.13, h: 0.078, size: 0.022 });
   I.push({ btn: true, id: 'goSettings', label: 'Settings', x: 0.155, y: 0.04, w: 0.13, h: 0.078, size: 0.022 });
   const st = ar.note || (!ar.aligned ? 'Not aligned yet: open Settings and align first.'
-                                     : 'Y (or wrist bar Menu) opens and closes this menu.');
+                                     : 'Y opens and closes this menu. Pinch the bar below it to move it.');
   I.push({ t: st, x: 0.015, y: 0.14, size: 0.0095, c: ar.aligned || ar.note ? '#8a8d99' : '#ff9f1a' });
   return I;
 }
@@ -1641,7 +1744,9 @@ const KIND_HEX = { home: '#3ecf8e', home_frees: '#4fd1c5', park: '#f0b54a' };
 function sortItems() {
   const I = [], sort = state?.sort, prog = state?.program, sc = state?.scan;
   const running = !!prog?.active, busy = ar.scanBusy || !!sc?.busy;
-  I.push({ t: 'Sorting demo', x: 0.015, y: 0.021, size: 0.014, b: true });
+  I.push({ t: 'Sorting demo', x: 0.015, y: 0.021, size: 0.014, b: true, maxW: 0.125 });
+  I.push({ btn: true, id: 'camera', label: cameraButtonLabel(), x: 0.148, y: 0.006, w: 0.138, h: 0.028, size: 0.0105,
+           disabled: busy });
   I.push({ btn: true, id: 'homepage', label: 'Homepage', x: SORT_W - 0.087, y: 0.006, w: 0.077, h: 0.028, size: 0.0105 });
   I.push({ btn: true, id: 'scan', label: busy ? 'Scanning...' : 'Scan', x: 0.015, y: 0.045, w: 0.085, h: 0.04, disabled: running || busy });
   I.push({ btn: true, id: 'run', label: 'Run', x: 0.105, y: 0.045, w: 0.085, h: 0.04,
@@ -1674,11 +1779,29 @@ function sortItems() {
   return I;
 }
 
+function cameraButtonLabel() {
+  const id = preferredCamera();
+  if (!id) return 'Camera: auto';
+  const i = ar.cams.findIndex(d => d.deviceId === id);
+  return 'Camera: ' + (i >= 0 ? shortName(ar.cams[i].label, i) : 'picked');
+}
+async function refreshCams() { try { ar.cams = await listCameras(); } catch { ar.cams = []; } }
+async function cycleCamera() {                       // auto -> each camera in turn -> auto
+  await refreshCams();
+  if (!ar.cams.length) { ar.note = 'The browser offers no camera.'; return; }
+  const i = ar.cams.findIndex(d => d.deviceId === preferredCamera());
+  const next = i + 1 < ar.cams.length ? ar.cams[i + 1] : null;
+  setPreferredCamera(next ? next.deviceId : '');
+  ar.note = next ? `Scan will use ${next.label || shortName('', i + 1)}.`
+                 : 'Scan picks a camera facing back by itself.';
+}
+
 async function arScan() {
   if (ar.scanBusy) return;
   ar.scanBusy = true; ar.camNote = 'Taking a photo...'; ar.note = '';
   try {
     const shot = await captureJPEG();
+    refreshCams();                                     // names are known now: label the Camera button
     const info = `${shot.label} \u00b7 ${shot.width}\u00d7${shot.height}`;
     ar.camNote = info + ' \u00b7 finding the blocks...';
     const t0 = performance.now();
@@ -1748,6 +1871,7 @@ Object.assign(actions, {
   goSort: () => goScreen('sort'),
   goSettings: () => goScreen('settings'),
   scan: arScan,
+  camera: cycleCamera,
   run: async () => { const r = await api('/api/sort/run', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not start'); },
   armHome: async () => { const r = await api('/api/go_home', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not move'); },
   menu: () => (ar.menuOpen ? closeMenu() : openMenu()),
@@ -2005,8 +2129,8 @@ function updateHud(head) {
     L.push({ t: H ? 'Wrist bar: poke with your right index finger' : 'Y: menu · B: hologram on/off · X: hide this panel', c: '#8a8d99' });
   } else if (ar.screen === 'sort') {
     L.push({ t: 'Sorting demo', b: true, c: '#3ecf8e' });
-    L.push(H ? 'Wrist bar Menu: Scan, Run, STOP. Wrist bar STOP while the robot moves.'
-             : 'Y: sort panel (Scan, Run, STOP) · A: STOP while the robot moves · B: hologram');
+    L.push(H ? 'Wrist bar Menu: Scan, Run, STOP. Pinch the bar under a menu to move it.'
+             : 'Y: sort panel (Scan, Run, STOP) · A: STOP while moving · trigger on the bar under a menu: move it');
     if (state?.scan?.msg) L.push({ t: state.scan.msg, c: state.scan.ok ? '#3ecf8e' : '#ff9f1a' });
   } else {
     L.push({ t: 'Aligned and locked' + (ar.anchor ? (ar.persisted ? ' · saved for next time' : ' · this session only') : ''),
@@ -2031,7 +2155,8 @@ function arFrame(frame, dt) {
   updateDrag(head);
   updateDwell(now, head);
   updateWristBar(head);
-  if (ar.openOnStart && head.position.lengthSq() > 0) { ar.openOnStart = false; openMenu(); }
+  if (ar.openOnStart && head.position.lengthSq() > 0 && !ar.restoring) { ar.openOnStart = false; openMenu(); }
+  updatePanelDrag(head);
   if (ar.menuOpen) screenPanel().set(ar.screen === 'settings' ? menuItems(now) : ar.screen === 'sort' ? sortItems() : homeItems());
   sortingUI?.arFrame(head);
   updatePanels(now);
@@ -2117,7 +2242,10 @@ renderer.xr.addEventListener('sessionstart', () => {
                       tuning: false, quality: '', note: '', placeOnNextFrame: true,
                       tuneMode: false, drag: null, poke: { armed: false, until: 0 }, persisted: false,
                       editing: false, editBackup: null, menuOpen: false, confirm: { id: null, until: 0 },
-                      screen: 'home', openOnStart: true, holoBeforeSort: null, scanBusy: false, camNote: '' });
+                      screen: 'home', openOnStart: true, holoBeforeSort: null, scanBusy: false, camNote: '',
+                      panelDrag: null });
+  try { const saved = store.get('so101-twin-menu'); ar.menuSpot = saved ? { frame: 'robot', p: JSON.parse(saved) } : null; }
+  catch { ar.menuSpot = null; }
   Object.assign(ar.dwell, { pos: null, n: 0, armed: true, last: null });
   wristBar.placed = false;
   for (const p of menuPanels()) p.mesh.visible = false;
@@ -2135,7 +2263,7 @@ renderer.xr.addEventListener('sessionend', () => {
   hud.visible = false; wristBar.mesh.visible = false; pointerDot.visible = false; dwellRing.visible = false;
   if (ar.screen === 'sort') leaveSort();
   for (const p of menuPanels()) p.mesh.visible = false;
-  ar.screen = 'home';
+  ar.screen = 'home'; ar.panelDrag = null;
   ar.editing = false; ar.editBackup = null; ar.menuOpen = false;
   setLiftGlow(false);
   hideOverlays();
@@ -2148,7 +2276,7 @@ renderer.xr.addEventListener('sessionend', () => {
   say('AR session ended');
 });
 setupARButton();
-window.twinAR = { ar, CAL_PTS, hud, wristBar, arMenu, homePanel, sortPanel, goScreen, openMenu, closeMenu, actions, hands, liftCenter, arControllers, overlay, motion, labelModes: LABEL_MODES, getLabelMode: () => labelMode, getSample: () => ({ last: lastSample, t: lastSampleT, same: lastSample === state, cur: state && state.actual }) };   // handy in the devtools console (chrome://inspect)
+window.twinAR = { ar, CAL_PTS, hud, wristBar, arMenu, homePanel, sortPanel, goScreen, openMenu, closeMenu, actions, hands, menuPanels, liftCenter, arControllers, overlay, motion, labelModes: LABEL_MODES, getLabelMode: () => labelMode, getSample: () => ({ last: lastSample, t: lastSampleT, same: lastSample === state, cur: state && state.actual }) };   // handy in the devtools console (chrome://inspect)
 
 // ---------------------------------------------------------------- render loop
 let lastT = 0;
