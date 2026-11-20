@@ -18,7 +18,7 @@ const MARKER_BITS = ['111111101001110101111001111011111111', '111111111111100001
                      '111111111001111001111011100101111111', '111111101101101101110111110011111111'];
 const COLORS = { blue: 0x2f74e0, black: 0x26272b, red: 0xd8393b, yellow: 0xf2c230, green: 0x3cae4f,
                  orange: 0xf08a24, purple: 0x9450c2, block: 0x9a9caa };
-const CYCLE = [null, 'blue', 'black', 'red', 'yellow'];
+const CYCLE = [null, 'green', 'yellow', 'blue', 'red'];   // demo set: 3 green, 2 yellow, 2 blue, 2 red
 const KIND_COLOR = { home: 0x3ecf8e, home_frees: 0x4fd1c5, park: 0xf0b54a };
 
 // cell n -> (x, y) in mm from the grid centre; x to the right, y towards the robot
@@ -167,11 +167,6 @@ export function initSorting(ctx) {
   }
 
   // ---- panel ----------------------------------------------------------------------
-  const sel = $('algSel');
-  for (const [k, name] of Object.entries(ctx.cfg.algorithms || {})) {
-    const o = document.createElement('option'); o.value = k; o.textContent = name; sel.append(o);
-  }
-  sel.value = 'astar';
   const cellBtns = [];
   for (let n = 1; n <= 9; n++) {
     const b = document.createElement('button'); b.className = 'scell'; b.dataset.n = n;
@@ -193,18 +188,18 @@ export function initSorting(ctx) {
     const r = await api('/api/board', { cells: {} }); if (!r.ok) say(r.data.msg, true);
   };
   $('sortPlan').onclick = async () => {
-    const r = await api('/api/sort/plan', { algorithm: sel.value }); say(r.data.msg, !r.ok);
+    const r = await api('/api/sort/plan', {}); say(r.data.msg, !r.ok);
   };
   $('sortRun').onclick = async () => {
-    const r = await api('/api/sort/run', { algorithm: sel.value }); say(r.data.msg, !r.ok);
+    const r = await api('/api/sort/run', {}); say(r.data.msg, !r.ok);
   };
   $('sortHome').onclick = async () => { const r = await api('/api/go_home', {}); say(r.data.msg, !r.ok); };
 
   function renderPlan(sort, running) {
-    const key = JSON.stringify([sort?.algorithm, sort?.moves?.length, sort?.start, sort?.current, sort?.done, running]);
+    const key = JSON.stringify([sort?.moves?.length, sort?.start, sort?.current, sort?.done, running]);
     if (key === planKey) return;
     planKey = key;
-    $('sortSummary').textContent = sort ? sort.summary.text : 'No plan yet. Set the board, then Plan or Run.';
+    $('sortSummary').textContent = sort ? sort.summary.short : 'No plan yet. Set the board, then Plan or Run.';
     const ol = $('sortList'); ol.innerHTML = '';
     arrows.clear();
     if (!sort) return;
@@ -226,14 +221,18 @@ export function initSorting(ctx) {
     if (next) { ringSrc.position.copy(cellPos(next.src, 0.0015)); ringDst.position.copy(cellPos(next.dst, 0.0015)); }
   }
 
-  async function update(st) {
+  function update(st) {
+    // Synchronous on purpose: an await here would let an older state be drawn after a newer one.
     state = st;
     if (st.poses_version !== posesVersion) {
       posesVersion = st.poses_version;
-      try { fitGrid((await api('/api/poses')).data); } catch { /* next poll retries */ }
-      $('gridFit').textContent = fit
-        ? `Grid placed from ${fit.n} taught grab pose${fit.n > 1 ? 's' : ''}. Fit error ${fit.rmsMM.toFixed(1)} mm.`
-        : 'Teach at least 2 grab poses to show the grid in the twin.';
+      api('/api/poses').then(r => {
+        fitGrid(r.data);
+        $('gridFit').textContent = fit
+          ? `Grid placed from ${fit.n} taught grab pose${fit.n > 1 ? 's' : ''}. Fit error ${fit.rmsMM.toFixed(1)} mm.`
+          : 'Teach at least 2 grab poses to show the grid in the twin.';
+        group.visible = !!fit && !renderer.xr.isPresenting;
+      }).catch(() => { posesVersion = -1; });     // retry on the next poll
     }
     const running = !!st.program?.active;
     for (let n = 1; n <= 9; n++) {

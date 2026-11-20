@@ -31,6 +31,10 @@ import itertools
 
 CELLS = tuple(range(1, 10))
 DEFAULT_TARGETS = {"A": (1, 4, 7), "B": (2, 8), "C": (6,)}
+# Demo block set (Nov 2026): 3 green, 2 yellow, 2 blue, 2 red. Green is always the colour with
+# 3 blocks; B (2 blocks) and C (1 block) are any two of yellow, blue, red. Checking this catches
+# a detector mistake (for example 3 "blue") before the robot moves. None = no check.
+MAIN_COLOR = "green"
 ROLE_COUNTS = {"A": 3, "B": 2, "C": 1}
 
 ALGORITHMS = {
@@ -62,8 +66,8 @@ def board_dict(state):
     return {str(i + 1): c for i, c in enumerate(state)}
 
 
-def infer_roles(state):
-    """The colour with 3 blocks is A, with 2 is B, with 1 is C."""
+def infer_roles(state, main=MAIN_COLOR):
+    """The colour with 3 blocks is A, with 2 is B, with 1 is C. A must be `main` if given."""
     counts = Counter(c for c in state if c)
     by_count = {}
     for colour, n in counts.items():
@@ -71,6 +75,10 @@ def infer_roles(state):
     if sorted(counts.values()) != [1, 2, 3] or len(counts) != 3:
         found = ", ".join(f"{n} {c}" for c, n in sorted(counts.items())) or "no blocks"
         raise PlanError(f"Need 3 + 2 + 1 blocks of three different colours. Found: {found}.")
+    if main and by_count[3][0] != main:
+        found = ", ".join(f"{n} {c}" for c, n in sorted(counts.items()))
+        raise PlanError(f"{main.capitalize()} must be the colour with 3 blocks. Found: {found}. "
+                        f"Check the board (or the scan).")
     return {"A": by_count[3][0], "B": by_count[2][0], "C": by_count[1][0]}
 
 
@@ -245,12 +253,12 @@ def _explain(state, src, dst, goal):
     return "park", f"Park {colour} in cell {dst} for now."
 
 
-def plan(cells, algorithm="astar", targets=None):
+def plan(cells, algorithm="astar", targets=None, main=MAIN_COLOR):
     """Main entry. cells: {"1": "blue", ...}. Returns a JSON-ready dict."""
     if algorithm not in ALGORITHMS:
         raise PlanError(f"unknown algorithm {algorithm}, use one of {', '.join(ALGORITHMS)}")
     start = normalise_board(cells)
-    roles = infer_roles(start)
+    roles = infer_roles(start, main)
     goal = goal_map(roles, targets)
     if algorithm == "greedy_simple":
         moves, explored = _greedy(start, goal, smart=False)
@@ -284,6 +292,7 @@ def plan(cells, algorithm="astar", targets=None):
             "length": len(steps),
             "optimal": len(steps) == best,
             "explored": explored,
+            "short": f"Plan: {len(steps)} move{'s' if len(steps) != 1 else ''}.",
             "text": (f"{m} misplaced + {len(lp)} loop{'s' if len(lp) != 1 else ''} = {best} moves minimum. "
                      f"{ALGORITHMS[algorithm]} plan: {len(steps)} moves"
                      f"{' (optimal)' if len(steps) == best else f' ({len(steps) - best} more than needed)'}. "
@@ -295,10 +304,10 @@ def plan(cells, algorithm="astar", targets=None):
 # ---- self test -------------------------------------------------------------------
 def selftest():
     """Check every claim in the docstring on all 5040 start layouts."""
-    roles = {"A": "blue", "B": "black", "C": "yellow"}
+    roles = {"A": "green", "B": "blue", "C": "red"}
     goal = goal_map(roles)
     target = goal_state(goal)
-    items = ["blue"] * 3 + ["black"] * 2 + ["yellow"] + [None] * 3
+    items = ["green"] * 3 + ["blue"] * 2 + ["red"] + [None] * 3
     starts = sorted(set(itertools.permutations(items)), key=lambda s: [c or "" for c in s])
     dist = {target: 0}
     q = deque([target])
@@ -335,7 +344,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         selftest()
     else:      # example: the layout in the phone photo
-        demo = {"1": "blue", "3": "black", "4": "black", "5": "yellow", "7": "blue", "9": "blue"}
+        demo = {"1": "green", "3": "yellow", "4": "yellow", "5": "red", "7": "green", "9": "green"}
         for a in ALGORITHMS:
             p = plan(demo, a)
             print(p["summary"]["text"])

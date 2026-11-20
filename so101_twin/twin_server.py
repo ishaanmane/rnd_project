@@ -73,8 +73,14 @@ DEFAULT_HOME = {"shoulder_pan": 1.2, "shoulder_lift": -1.3, "elbow_flex": 0.3,
 # grip = close on a block, home = at the Home pose.
 DEFAULT_GRIPPER = {"teach": 19.5, "open": 19.5, "grip": 15.0, "home": 1.0}
 SLOT_RE = re.compile(r"^(home|[1-9]\.(hover|grab))$")
-ARRIVE_TOL = 3.0       # deg: sequencer accepts a pose when every arm joint is this close
-ARRIVE_TIMEOUT = 3.0   # s: after the motion ends, wait at most this long for the arm to arrive
+ARRIVE_TOL = 3.0       # deg: a pose counts as reached when every arm joint is this close
+# The sequencer never stops for a missed pose (servos can sit a few degrees off, and this setup
+# has no collisions). After a motion it waits for the arm to catch up, but only until the arm
+# stops moving or ARRIVE_WAIT has passed, then it carries on.
+ARRIVE_WAIT = 1.0      # s: longest wait for the arm to catch up after a motion
+STILL_DEG = 0.15       # deg per loop tick: below this the arm counts as not moving
+STILL_S = 0.25         # s: not moving for this long = settled, carry on
+SORT_ALGORITHM = "greedy_simple"   # the one planner the demo uses
 GRIP_DWELL = 0.6       # s: wait after a gripper command (the block stops the jaw early)
 TORQUE_CHECK_S = 1.0   # s: while the arm is free, re-read Torque_Enable this often and fix it if it came back
 COLOR_RE = re.compile(r"^[a-z]{1,12}$")
@@ -621,7 +627,7 @@ class Controller:
             self.sort = None
         return clean
 
-    def make_plan(self, algorithm):
+    def make_plan(self, algorithm=SORT_ALGORITHM):
         with self.lock:
             board = dict(self.board)
         p = sorting.plan(board, algorithm)        # raises sorting.PlanError with a readable message
@@ -631,11 +637,11 @@ class Controller:
             self.sort = p
         return p
 
-    def run_sort(self, algorithm):
+    def run_sort(self, algorithm=SORT_ALGORITHM):
         p = self.make_plan(algorithm)
         if not p["moves"]:
             return 200, "Already sorted: nothing to do.", p
-        code, msg = self.run_moves([(m["src"], m["dst"]) for m in p["moves"]], f"Sort ({p['algorithm_name']})")
+        code, msg = self.run_moves([(m["src"], m["dst"]) for m in p["moves"]], "Sort")
         return code, msg, p
 
     def _program_tick(self, dt):
@@ -676,13 +682,14 @@ class Controller:
                 if s < 1.0 or max(abs(self.target[j] - self.cmd[j]) for j in ARM) > SETTLE_TOL:
                     return
                 err = max(abs(self.actual[j] - st["pose"][j]) for j in ARM)
-                if err > ARRIVE_TOL:
-                    if st["_t"] - T > ARRIVE_TIMEOUT:
-                        self.program_msg = (f"{p['name']} stopped: the arm did not reach "
-                                            f"'{st['label']}' ({err:.1f} deg off). Check for a collision.")
-                        self.program = None
-                        self.target = dict(self.cmd)
-                    return
+                if err > ARRIVE_TOL:           # not there yet: wait while it is still moving, never abort
+                    prev = st.get("_prev")
+                    moving = prev is not None and max(abs(self.actual[j] - prev[j]) for j in ARM) > STILL_DEG
+                    st["_prev"] = dict(self.actual)
+                    st["_still"] = 0.0 if moving or prev is None else st.get("_still", 0.0) + dt
+                    if st["_still"] < STILL_S and st["_t"] - T < ARRIVE_WAIT:
+                        return
+                p["worst"] = max(p.get("worst", 0.0), err)
             else:
                 if abs(self.cmd["gripper"] - st["value"]) > SETTLE_TOL:
                     st["_t"] = 0.0             # dwell counts from when the command arrives
@@ -690,7 +697,9 @@ class Controller:
                 if st["_t"] < GRIP_DWELL:
                     return
             p["i"] += 1
-        self.program_msg = f"{p['name']} finished."
+        worst = p.get("worst", 0.0)
+        self.program_msg = f"{p['name']} finished." + (
+            f" Largest pose error {worst:.1f} deg (carried on)." if worst > ARRIVE_TOL else "")
         self.program = None
 
     def _program_status(self):
@@ -1014,11 +1023,11 @@ def make_handler(ctrl):
                 except (ValueError, TypeError, AttributeError) as e:
                     return self._json(400, {"msg": str(e)})
             if p in ("/api/sort/plan", "/api/sort/run"):
-                alg = str(body.get("algorithm") or "astar")
+                alg = str(body.get("algorithm") or SORT_ALGORITHM)
                 try:
                     if p == "/api/sort/plan":
                         plan = ctrl.make_plan(alg)
-                        return self._json(200, {"msg": plan["summary"]["text"], "plan": plan})
+                        return self._json(200, {"msg": plan["summary"]["short"], "plan": plan})
                     code, msg, plan = ctrl.run_sort(alg)
                     return self._json(code, {"msg": msg, "plan": plan})
                 except sorting.PlanError as e:

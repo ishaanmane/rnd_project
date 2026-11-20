@@ -155,7 +155,9 @@ hiccups do not distort them.
 ## Sorting demo
 
 Goal: 3 blocks of colour A in cells 1, 4, 7, 2 of colour B in cells 2, 8, 1 of colour C in cell 6.
-The colours are worked out from the counts (3 = A, 2 = B, 1 = C). Cells 3, 5 and 9 end empty and
+The colours are worked out from the counts (3 = A, 2 = B, 1 = C). Demo set: 3 green, 2 yellow,
+2 blue, 2 red. Green must be the colour with 3 blocks (`MAIN_COLOR` in sorting.py), so a misread
+board is refused before the robot moves. Cells 3, 5 and 9 end empty and
 serve as parking cells. Planner: `sorting.py` (`python sorting.py test` checks every claim on all
 5040 start layouts, about 2 minutes).
 
@@ -180,7 +182,7 @@ Gripper values (teach, open, grip, home) can be changed on the same page without
 
 ### 2. Run
 
-In the twin's **Sorting demo** panel: click cells to set the board, choose the algorithm, then
+In the twin's **Sorting demo** panel: click cells to set the board, then
 **Plan** (shows the moves and why) or **Run**. Every move is:
 
     pick:  hover -> grab -> gripper to 15 % -> hover
@@ -188,7 +190,9 @@ In the twin's **Sorting demo** panel: click cells to set the board, choose the a
 
 The run starts by opening the gripper and ends at Home (gripper 1 %). Every motion is speed-capped
 and moves all joints together along one straight line in joint space. STOP aborts at once.
-If a pose is not reached within 3 s (for example a collision), the run stops by itself.
+A pose missed by a few degrees (jittery servos) never stops the run: after each motion the
+sequencer waits until the arm stops moving (at most 1 s), then carries on. The finish message
+reports the largest pose error.
 
 The twin draws the sheet, the blocks and the plan arrows (bright = next move). The sheet is placed
 from the taught grab poses; the panel shows the fit error in mm. More than about 10 mm means the

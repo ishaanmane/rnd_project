@@ -32,7 +32,7 @@ from vision import PX_PER_MM, draw_photo, draw_rectified, find_sheet
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCAN_DIR = os.path.join(HERE, "scans")
 PAGE = os.path.join(HERE, "web", "detector.html")
-DEFAULT_COLORS = ["red", "black", "blue", "yellow"]
+DEFAULT_COLORS = ["green", "yellow", "blue", "red"]   # demo set: 3 green, 2 yellow, 2 blue, 2 red
 # The exact model version tested on 19 Nov 2026. Pinning it means a later
 # update by NVIDIA cannot change the detector's behaviour before the demo.
 MODEL_REVISION = "c32291ca5e996f5a7a485845b4f57a233936bba0"
@@ -281,7 +281,7 @@ def main():
     ap.add_argument("--revision", default=MODEL_REVISION,
                     help="model commit to use (default: the tested one). 'latest' = newest on the Hub")
     ap.add_argument("--colors", default=",".join(DEFAULT_COLORS))
-    ap.add_argument("--expect", default=None, help="expected counts, e.g. blue:3,black:2,yellow:1")
+    ap.add_argument("--expect", default=None, help="expected counts, e.g. green:3,blue:2,red:1")
     ap.add_argument("--phrase", default="{color} cube", help="text query, {color} is filled in")
     ap.add_argument("--mode", choices=["detect", "point"], default="detect")
     ap.add_argument("--greedy", action="store_true", help="no sampling (repeatable answers)")

@@ -61,7 +61,7 @@ python locate_service.py --backend color            # fallback without the model
 Every scan saves the photo, the top-down image, the annotated image and the
 JSON result in `scans/`.
 
-Useful options: `--colors red,black,blue,yellow`, `--expect blue:3,black:2,yellow:1`,
+Useful options: `--colors green,yellow,blue,red`, `--expect green:3,blue:2,red:1`,
 `--phrase "{color} block"`, `--mode point` (point queries instead of boxes),
 `--greedy` (no sampling).
 
@@ -71,7 +71,7 @@ Normal and supported. Give the expected counts and the answer says whether
 they match (`counts`, `counts_ok`, plus a warning such as "expected 3 blue, found 2"):
 
 ```bash
-python locate_service.py --expect blue:3,black:2,yellow:1
+python locate_service.py --expect green:3,blue:2,red:1
 ```
 
 The test page has an "Expected" field for the same thing.
@@ -88,7 +88,7 @@ For the demo day, run fully offline so a slow network cannot delay start-up:
 
 ```bash
 export HF_HUB_OFFLINE=1
-python locate_service.py --expect blue:3,black:2,yellow:1
+python locate_service.py --expect green:3,blue:2,red:1
 ```
 
 ## API
