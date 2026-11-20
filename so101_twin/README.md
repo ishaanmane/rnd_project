@@ -192,23 +192,43 @@ Two terminals:
 ```bash
 # 1: the robot (lerobot env)
 python twin_server.py --port /dev/ttyACM0 --id asherbot --http-port 8001
-# 2: the block detector (locany env), needed for Scan
+# 2: the block detector (locany env), needed for pictures
 cd detector && python locate_service.py
 ```
 
 **In AR (Quest):** on the 2D page press **Allow camera (for Scan in AR)** once, then Enter AR.
 Homepage > **Sort**. The hologram turns off (B brings it back). With the arm at Home, look down
-at the whole sheet and press **Scan**: the headset camera takes one photo, the detector finds the
-blocks, and each detected block gets a coloured outline on the real grid. The next move shows as
+at the whole sheet and press **Take picture**. The photo appears large beside the panel:
+**Use this photo** sends it to the detector, **Click again** throws it away and takes a new one
+(nothing leaves the headset before Use). The detector finds the blocks, and each detected block
+gets a coloured outline on the real grid. The next move shows as
 an orange ring (pick), a green ring (place) and an arrow; a banner beyond the far edge of the grid
 says the move and why. Check the outlines, then press **Run**. STOP: the panel, A, or the wrist bar.
-A scan is refused unless it finds 3 green + 2 + 1 blocks (then rescan).
+A photo is refused unless it shows 3 green + 2 + 1 blocks (then take another).
 
-**Camera button** (top of the Sort panel): "Camera: auto" picks a camera that faces the world
-("facing back"). The Quest names its cameras like "camera 0, facing front", "camera 1, facing back",
-"camera 2, facing back"; the name is the device, it does not change with where you look. Pressing
-the button cycles through the cameras the browser offers and back to auto; the choice is remembered.
-The line under the scan result shows which camera took the photo and its resolution.
+**Photos are deleted** when their sort finishes, when a newer photo replaces them, or when the
+board is edited by hand: the photo and everything the detector made from it (detector/scans/).
+Start twin_server.py with `--keep-scans` to keep them (for example to debug a failed picture).
+
+**If the headset camera shows the wrong picture** (the browser may offer only a camera that is
+not the room view): take the photo with the Quest's own Camera app, then on the 2D page (outside AR)
+press **Scan photo…** and pick it from the gallery. The board, plan and AR overlay work the same.
+
+**Headset cameras permission (needed once).** The Quest Browser offers three cameras:
+"camera 0, facing front" is the **avatar camera** (virtual, for video calls: it never sees the room,
+its pictures are black); "camera 1, facing back" and "camera 2, facing back" are the left and right
+passthrough cameras. The two real ones are offered only when the Browser has the **Headset cameras**
+permission. The Quest's camera prompt comes with "Virtual cameras" ticked and "Headset cameras"
+unticked, so a plain Allow gives only the avatar camera and the Browser does not ask again. Fix:
+on `localhost:8001` tap the **lock icon left of the address bar > Headset cameras > Allow** (or
+Settings > Privacy & safety > Browser > Headset cameras ON), then reload. Needs Quest 3 / 3S,
+Horizon OS v74+, Quest Browser 40.1+. "Allow camera" on the 2D page tells you which you have.
+The page refuses the avatar camera and black pictures, and says what to change.
+
+**Camera button** (top of the Sort panel): "Camera: auto" picks a passthrough camera ("facing back").
+Pressing it cycles through the cameras the browser offers (Cam 0 avatar, Cam 1 left, Cam 2 right)
+and back to auto; the choice is remembered.
+The line under the result shows which camera took the photo and its resolution.
 
 **On the PC:** set the board by clicking cells, or **Scan photo…** (for example a phone photo
 taken from above), then **Plan** (shows the moves and why) or **Run**. Every move is:

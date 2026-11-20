@@ -170,7 +170,7 @@ export function initSorting(ctx) {
   const KIND_HEX = { home: '#3ecf8e', home_frees: '#4fd1c5', park: '#f0b54a' };
   function updateBanner(st) {
     const sort = st.sort, p = st.program, sc = st.scan;
-    if (sc?.busy) return drawBanner('Scanning...', '#4aa3ff', 'Taking a photo and finding the blocks.', '');
+    if (sc?.busy) return drawBanner('Finding the blocks...', '#4aa3ff', 'The detector is reading the photo.', '');
     if (sort && sort.moves.length) {
       const N = sort.moves.length;
       // while running: the move the robot is doing (it stays current until the next move starts)
@@ -184,9 +184,9 @@ export function initSorting(ctx) {
                                  `First: ${cur.color} from cell ${cur.src} to cell ${cur.dst}. ${cur.why}`,
                                  p?.msg && !p.active ? p.msg : '');
     }
-    if (sc && !sc.ok) return drawBanner('Scan problem', '#ff9f1a', sc.msg, 'Fix it and press Scan again.');
+    if (sc && !sc.ok) return drawBanner('Scan problem', '#ff9f1a', sc.msg, 'Fix it and press Take picture again.');
     if (sc?.ok) return drawBanner('Already sorted', '#3ecf8e', sc.msg, '');
-    drawBanner('Ready to scan', '#e8e8e8', 'Put the arm at Home, look down at the whole sheet, then press Scan.', '');
+    drawBanner('Ready for a picture', '#e8e8e8', 'Put the arm at Home, look down at the whole sheet, then press Take picture.', '');
   }
 
   function cellPos(n, y = 0) { const [x, z] = cellMM(n); return new THREE.Vector3(x / 1000, y, z / 1000); }

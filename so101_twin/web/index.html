@@ -250,7 +250,7 @@ import URDFLoader from 'urdf-loader';
 import { PointerURDFDragControls } from 'urdf-drag';
 import { initSorting } from '/board.js';
 import { cameraSupported, allowCamera, cameraPermission, captureJPEG, listCameras,
-         preferredCamera, setPreferredCamera, shortName } from '/questcam.js';
+         preferredCamera, setPreferredCamera, shortName, isRoomCamera, HEADSET_CAMERAS_FIX } from '/questcam.js';
 
 const JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
 const UNIT = j => j === 'gripper' ? '%' : '°';
@@ -818,6 +818,8 @@ const ar = {
   openOnStart: false,                 // show the homepage on the first AR frame
   holoBeforeSort: null,               // hologram state to restore when leaving the Sort screen
   scanBusy: false, camNote: '',       // Scan with the Quest camera
+  shot: null,                         // a photo waiting for "Use this photo" / "Click again"
+  camError: null,                     // {short, fix} when the camera cannot give a usable picture
   cams: [],                           // cameras the browser offers (for the Camera button)
   panelDrag: null,                    // a menu being moved by its bar: {panel, ctrl|hand, offset}
   menuSpot: null,                     // where you last put a menu: {frame: 'robot'|'world', p: [x,y,z]}
@@ -1710,6 +1712,7 @@ function enterSort() {                                      // hologram off whil
   sortingUI?.refreshVisibility();
 }
 function leaveSort() {
+  ar.shot = null; hidePreview();                            // an unused photo is thrown away
   if (ar.holoBeforeSort !== null) { ar.holo = ar.holoBeforeSort; applyLook(); }
   ar.holoBeforeSort = null;
   sortingUI?.refreshVisibility();
@@ -1748,17 +1751,27 @@ function sortItems() {
   I.push({ btn: true, id: 'camera', label: cameraButtonLabel(), x: 0.148, y: 0.006, w: 0.138, h: 0.028, size: 0.0105,
            disabled: busy });
   I.push({ btn: true, id: 'homepage', label: 'Homepage', x: SORT_W - 0.087, y: 0.006, w: 0.077, h: 0.028, size: 0.0105 });
-  I.push({ btn: true, id: 'scan', label: busy ? 'Scanning...' : 'Scan', x: 0.015, y: 0.045, w: 0.085, h: 0.04, disabled: running || busy });
-  I.push({ btn: true, id: 'run', label: 'Run', x: 0.105, y: 0.045, w: 0.085, h: 0.04,
-           disabled: running || busy || !sort?.moves?.length || sort.done >= sort.moves.length });
-  I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.195, y: 0.045, w: 0.085, h: 0.04, danger: true });
-  I.push({ btn: true, id: 'armHome', label: 'Arm Home', x: 0.285, y: 0.045, w: 0.08, h: 0.04, size: 0.0125, disabled: running });
+  if (ar.shot) {                                         // reviewing a photo
+    I.push({ btn: true, id: 'usePhoto', label: 'Use this photo', x: 0.015, y: 0.045, w: 0.175, h: 0.04, on: true, size: 0.0155 });
+    I.push({ btn: true, id: 'again', label: 'Click again', x: 0.195, y: 0.045, w: 0.085, h: 0.04, size: 0.0125 });
+    I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.285, y: 0.045, w: 0.08, h: 0.04, danger: true });
+  } else {
+    I.push({ btn: true, id: 'scan', label: busy ? 'Working...' : 'Take picture', x: 0.015, y: 0.045, w: 0.085, h: 0.04,
+             size: 0.0125, disabled: running || busy });
+    I.push({ btn: true, id: 'run', label: 'Run', x: 0.105, y: 0.045, w: 0.085, h: 0.04,
+             disabled: running || busy || !sort?.moves?.length || sort.done >= sort.moves.length });
+    I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.195, y: 0.045, w: 0.085, h: 0.04, danger: true });
+    I.push({ btn: true, id: 'armHome', label: 'Arm Home', x: 0.285, y: 0.045, w: 0.08, h: 0.04, size: 0.0125, disabled: running });
+  }
   // status: scan result, camera info, what the robot is doing
-  const scanLine = ar.scanBusy ? (ar.camNote || 'Taking a photo...') : sc?.busy ? 'Finding the blocks...' : (sc?.msg || ar.note ||
-                   (ar.aligned ? 'Arm at Home, look down at the whole sheet, press Scan.' : 'Not aligned: Homepage > Settings > Align.'));
+  const scanLine = ar.camError ? ar.camError.short
+                 : ar.shot ? 'Check the photo: the whole sheet, all 4 corner markers and every block visible?'
+                 : ar.scanBusy ? (ar.camNote || 'Taking a picture...') : sc?.busy ? 'Finding the blocks...' : (sc?.msg || ar.note ||
+                   (ar.aligned ? 'Arm at Home, look down at the whole sheet, press Take picture.' : 'Not aligned: Homepage > Settings > Align.'));
   I.push({ t: scanLine, x: 0.015, y: 0.103, size: 0.0098,
-           c: busy ? '#4aa3ff' : sc ? (sc.ok ? '#3ecf8e' : '#ff9f1a') : '#8a8d99' });
-  if (ar.camNote && !ar.scanBusy) I.push({ t: ar.camNote, x: 0.015, y: 0.122, size: 0.0085, c: '#8a8d99' });
+           c: ar.camError ? '#ff9f1a' : ar.shot || busy ? '#4aa3ff' : sc ? (sc.ok ? '#3ecf8e' : '#ff9f1a') : '#8a8d99' });
+  if (ar.camError) I.push({ t: ar.camError.fix, x: 0.015, y: 0.122, size: 0.0085, c: '#e8e8e8' });
+  else if (ar.camNote && !ar.scanBusy) I.push({ t: ar.camNote, x: 0.015, y: 0.122, size: 0.0085, c: '#8a8d99' });
   let doing = '';
   if (running) doing = `${prog.label}  (${prog.step}/${prog.count})`;
   else if (sort?.moves?.length) doing = sort.done >= sort.moves.length ? (prog?.msg || 'Sorted.')
@@ -1792,27 +1805,71 @@ async function cycleCamera() {                       // auto -> each camera in t
   const i = ar.cams.findIndex(d => d.deviceId === preferredCamera());
   const next = i + 1 < ar.cams.length ? ar.cams[i + 1] : null;
   setPreferredCamera(next ? next.deviceId : '');
-  ar.note = next ? `Scan will use ${next.label || shortName('', i + 1)}.`
-                 : 'Scan picks a camera facing back by itself.';
+  const n = ar.cams.length, room = ar.cams.filter(d => isRoomCamera(d.label)).length;
+  const offered = `The browser offers ${n} camera${n > 1 ? 's' : ''}` +
+                  (room ? `, ${room} of them headset cameras.` : ': no headset camera (turn on Headset cameras).');
+  ar.note = (next ? `Scan will use ${next.label || shortName('', i + 1)}. ` : 'Scan picks a camera facing back by itself. ') + offered;
 }
 
-async function arScan() {
+// The photo you just took, large beside the Sort panel, until you choose Use or Click again.
+const PREVIEW_W = 0.3, PREVIEW_H = 0.225;
+const preview = new THREE.Mesh(new THREE.PlaneGeometry(PREVIEW_W, PREVIEW_H), new THREE.MeshBasicMaterial({
+  transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide }));
+preview.renderOrder = 24; preview.visible = false;
+sortPanel.mesh.add(preview);
+async function showPreview(blob, w, h) {
+  try {
+    const img = new Image();
+    img.src = URL.createObjectURL(blob);
+    await img.decode();
+    const tex = new THREE.Texture(img);
+    tex.colorSpace = THREE.SRGBColorSpace; tex.needsUpdate = true;
+    if (preview.material.map) { URL.revokeObjectURL(preview.material.map.image.src); preview.material.map.dispose(); }
+    preview.material.map = tex; preview.material.needsUpdate = true;
+    const sy = (h / w) / (PREVIEW_H / PREVIEW_W);                 // keep the photo's shape
+    preview.scale.set(1, sy, 1);
+    preview.position.set(SORT_W / 2 + 0.012 + PREVIEW_W / 2, SORT_H / 2 - (PREVIEW_H * sy) / 2, 0);
+    preview.visible = true;
+  } catch { preview.visible = false; }
+}
+function hidePreview() {                            // forget the photo in the headset too
+  preview.visible = false;
+  const map = preview.material.map;
+  if (map) { URL.revokeObjectURL(map.image.src); map.dispose(); preview.material.map = null; preview.material.needsUpdate = true; }
+}
+
+// Take picture -> the photo shows large -> "Use this photo" sends it to the detector,
+// "Click again" throws it away and takes a new one. Nothing leaves the headset before "Use".
+async function takePicture() {
   if (ar.scanBusy) return;
-  ar.scanBusy = true; ar.camNote = 'Taking a photo...'; ar.note = '';
+  hidePreview(); ar.shot = null; ar.camError = null;
+  ar.scanBusy = true; ar.camNote = 'Taking a picture...'; ar.note = '';
   try {
     const shot = await captureJPEG();
     refreshCams();                                     // names are known now: label the Camera button
-    const info = `${shot.label} \u00b7 ${shot.width}\u00d7${shot.height}`;
-    ar.camNote = info + ' \u00b7 finding the blocks...';
+    ar.shot = shot;
+    ar.camNote = `${shot.label} \u00b7 ${shot.width}\u00d7${shot.height}`;
+    await showPreview(shot.blob, shot.width, shot.height);
+  } catch (e) {
+    ar.camError = e.short ? { short: e.short, fix: e.fix }
+      : { short: 'Camera error: ' + (e.name && e.name !== 'Error' ? e.name + ': ' : '') + e.message,
+          fix: 'Or take the photo with the Quest Camera app and use Scan photo on the 2D page.' };
+    ar.camNote = '';
+  } finally { ar.scanBusy = false; }
+}
+async function usePhoto() {
+  const shot = ar.shot;
+  if (!shot || ar.scanBusy) return;
+  ar.shot = null; hidePreview();
+  ar.scanBusy = true; ar.camNote = `${shot.label} \u00b7 ${shot.width}\u00d7${shot.height} \u00b7 finding the blocks...`;
+  try {
     const t0 = performance.now();
     const r = await fetch('/api/scan?source=quest', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: shot.blob });
     const d = await r.json().catch(() => ({}));
-    ar.camNote = `${info} \u00b7 ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    ar.camNote = `${shot.label} \u00b7 ${shot.width}\u00d7${shot.height} \u00b7 ${((performance.now() - t0) / 1000).toFixed(1)} s`;
     if (!r.ok && !d.scan) ar.note = d.msg || 'Scan failed.';
-  } catch (e) {
-    ar.camNote = 'Camera error: ' + (e.name && e.name !== 'Error' ? e.name + ': ' : '') + e.message;
-    ar.note = 'No camera in AR. Use "Scan photo" on the PC page instead.';
-  } finally { ar.scanBusy = false; }
+  } catch (e) { ar.note = 'Upload failed: ' + e.message; }
+  finally { ar.scanBusy = false; }
 }
 
 function menuItems(now) {
@@ -1870,7 +1927,9 @@ Object.assign(actions, {
   homepage: () => goScreen('home'),
   goSort: () => goScreen('sort'),
   goSettings: () => goScreen('settings'),
-  scan: arScan,
+  scan: takePicture,
+  usePhoto,
+  again: takePicture,
   camera: cycleCamera,
   run: async () => { const r = await api('/api/sort/run', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not start'); },
   armHome: async () => { const r = await api('/api/go_home', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not move'); },
@@ -2129,8 +2188,8 @@ function updateHud(head) {
     L.push({ t: H ? 'Wrist bar: poke with your right index finger' : 'Y: menu · B: hologram on/off · X: hide this panel', c: '#8a8d99' });
   } else if (ar.screen === 'sort') {
     L.push({ t: 'Sorting demo', b: true, c: '#3ecf8e' });
-    L.push(H ? 'Wrist bar Menu: Scan, Run, STOP. Pinch the bar under a menu to move it.'
-             : 'Y: sort panel (Scan, Run, STOP) · A: STOP while moving · trigger on the bar under a menu: move it');
+    L.push(H ? 'Wrist bar Menu: Take picture, Run, STOP. Pinch the bar under a menu to move it.'
+             : 'Y: sort panel (Take picture, Run, STOP) · A: STOP while moving · trigger on the bar under a menu: move it');
     if (state?.scan?.msg) L.push({ t: state.scan.msg, c: state.scan.ok ? '#3ecf8e' : '#ff9f1a' });
   } else {
     L.push({ t: 'Aligned and locked' + (ar.anchor ? (ar.persisted ? ' · saved for next time' : ' · this session only') : ''),
@@ -2224,9 +2283,13 @@ async function setupCameraButton() {
   btn.onclick = async () => {
     note.textContent = 'Asking for the camera...';
     try {
-      const labels = await allowCamera();
+      const r = await allowCamera();
       btn.textContent = 'Camera allowed (test again)';
-      note.textContent = 'Camera allowed. Found: ' + labels.join('; ');
+      note.textContent = r.roomCameras
+        ? `Headset cameras allowed (${r.roomCameras}). Found: ${r.names.join('; ')}`
+        : `Only the avatar camera is allowed (${r.names.join('; ')}); it never sees the room. ` +
+          HEADSET_CAMERAS_FIX.replace(/^Exit AR\. /, '');
+      note.style.color = r.roomCameras ? '' : '#f0b54a';
     } catch (e) {
       note.textContent = `No camera: ${e.name || 'Error'}: ${e.message}`;
     }
@@ -2243,7 +2306,7 @@ renderer.xr.addEventListener('sessionstart', () => {
                       tuneMode: false, drag: null, poke: { armed: false, until: 0 }, persisted: false,
                       editing: false, editBackup: null, menuOpen: false, confirm: { id: null, until: 0 },
                       screen: 'home', openOnStart: true, holoBeforeSort: null, scanBusy: false, camNote: '',
-                      panelDrag: null });
+                      panelDrag: null, shot: null });
   try { const saved = store.get('so101-twin-menu'); ar.menuSpot = saved ? { frame: 'robot', p: JSON.parse(saved) } : null; }
   catch { ar.menuSpot = null; }
   Object.assign(ar.dwell, { pos: null, n: 0, armed: true, last: null });

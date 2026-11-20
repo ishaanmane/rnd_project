@@ -40,6 +40,24 @@ MAX_BLOCK_MM = 70.0       # a detection box larger than this is not one cube
 MIN_BLOCK_MM = 10.0
 MAX_BODY = 25 * 2**20
 _SCAN_RE = re.compile(r"^scan_[0-9_]+_(photo|grid|annotated|result)\.(jpg|json)$")
+_STAMP_RE = re.compile(r"^scan_([0-9_]+?)_(photo|grid|annotated|result)\.(jpg|json)$")
+_KINDS = ("photo.jpg", "grid.jpg", "annotated.jpg", "result.json")
+
+
+def forget_scans(names):
+    """Delete every file of the scans these names belong to. Returns the deleted file names."""
+    gone = []
+    for name in names or []:
+        m = _STAMP_RE.match(str(name))
+        if not m:
+            continue
+        for kind in _KINDS:
+            fn = f"scan_{m.group(1)}_{kind}"
+            fp = os.path.join(SCAN_DIR, fn)
+            if os.path.isfile(fp):
+                os.remove(fp)
+                gone.append(fn)
+    return gone
 
 
 def decode_image(data):
@@ -244,6 +262,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlparse(self.path)
+        if url.path == "/api/forget":          # {"files": [...]}: delete those scans (photo and results)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                names = json.loads(self.rfile.read(n) or b"{}").get("files") or []
+            except (ValueError, AttributeError):
+                return self._send(400, {"ok": False, "error": "send JSON {\"files\": [...]}"})
+            return self._send(200, {"ok": True, "deleted": forget_scans(names)})
         if url.path != "/api/detect":
             return self._send(404, {"error": "not found"})
         n = int(self.headers.get("Content-Length") or 0)

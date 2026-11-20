@@ -310,6 +310,7 @@ class Controller:
         self.sort = None       # last plan from sorting.plan(), plus progress
         self.scan = None       # last scan result (see scan_image)
         self.detector_url = DETECTOR_URL
+        self.keep_scans = False   # False: a scan's photo is deleted when its sort finishes or a new scan replaces it
         self._torque_checked = 0.0
 
         # Read where the arm actually is BEFORE sending anything, so nothing jumps.
@@ -624,6 +625,7 @@ class Controller:
         with self.lock:
             if self.program is not None:
                 return 409, {"msg": "Wait for the robot to finish (or press STOP) before scanning."}
+            prev = self.scan                       # its photo is deleted once this scan is in
             self.scan = {"busy": True, "ok": False, "source": source, "msg": "Scanning..."}
         t0 = time.time()
         url = f"{self.detector_url}/api/detect?colors={SCAN_COLORS}"
@@ -642,7 +644,7 @@ class Controller:
                    f"Start detector/locate_service.py first. ({getattr(e, 'reason', e)})")
             with self.lock:
                 self.scan = {"busy": False, "ok": False, "source": source, "msg": msg,
-                             "time": time.strftime("%H:%M:%S")}
+                             "time": time.strftime("%H:%M:%S"), "files": (prev or {}).get("files") or {}}
             return 503, {"msg": msg, "scan": self.scan}
         scan = {"busy": False, "ok": False, "source": source, "time": time.strftime("%H:%M:%S"),
                 "cells": det.get("cells") or {}, "counts": det.get("counts") or {},
@@ -669,7 +671,27 @@ class Controller:
                 scan["ok"], scan["msg"] = False, str(e)
         with self.lock:
             self.scan = scan
+        if prev and prev.get("files"):            # the previous photo is no longer needed
+            self._forget_scan(prev)
         return (200 if scan["ok"] else 422), {"msg": scan["msg"], "scan": scan}
+
+    def _forget_scan(self, scan):
+        """Ask the detector to delete this scan's photo and result files (in the background)."""
+        files = list((scan.get("files") or {}).values())
+        scan["files"] = {}
+        if self.keep_scans or not files:
+            return
+        def job():
+            req = urllib.request.Request(f"{self.detector_url}/api/forget", method="POST",
+                                         data=json.dumps({"files": files}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    gone = json.loads(r.read()).get("deleted", [])
+                print(f"[scan] deleted {len(gone)} file(s) of the used photo")
+            except Exception as e:                  # detector stopped: nothing to delete there now
+                print(f"[scan] could not delete the photo files: {e}")
+        threading.Thread(target=job, daemon=True).start()
 
     def set_board(self, cells):
         clean = {str(n): None for n in range(1, 10)}
@@ -763,6 +785,9 @@ class Controller:
         self.program_msg = f"{p['name']} finished." + (
             f" Largest pose error {worst:.1f} deg (carried on)." if worst > ARRIVE_TOL else "")
         self.program = None
+        if p["name"] == "Sort" and self.scan and self.scan.get("files"):   # demo done: delete its photo
+            self._forget_scan(self.scan)
+            self.scan["msg"] = "Sorted. The photo has been deleted." if not self.keep_scans else "Sorted."
 
     def _program_status(self):
         p = self.program
@@ -1090,7 +1115,9 @@ def make_handler(ctrl):
             if p == "/api/board":
                 try:
                     board = ctrl.set_board(body.get("cells"))
-                    ctrl.scan = None                 # the board no longer comes from the last scan
+                    if ctrl.scan:                    # the board no longer comes from the last scan
+                        ctrl._forget_scan(ctrl.scan)
+                    ctrl.scan = None
                     return self._json(200, {"board": board})
                 except (ValueError, TypeError, AttributeError) as e:
                     return self._json(400, {"msg": str(e)})
@@ -1134,6 +1161,8 @@ def main():
     ap.add_argument("--http-port", type=int, default=8000)
     ap.add_argument("--detector", default=DETECTOR_URL,
                     help="block detector service for Scan (detector/locate_service.py)")
+    ap.add_argument("--keep-scans", action="store_true",
+                    help="keep scan photos (default: delete a photo when its sort finishes or a new scan replaces it)")
     args = ap.parse_args()
 
     if args.sim:
@@ -1149,6 +1178,7 @@ def main():
         os.makedirs(RECORD_DIR, exist_ok=True)
         ctrl = Controller(robot, args.max_speed)
         ctrl.detector_url = args.detector.rstrip("/")
+        ctrl.keep_scans = args.keep_scans
     except Exception:
         robot.disconnect()
         raise
