@@ -30,6 +30,9 @@ Sorting demo (see sorting.py and web/teach.html):
                   place: hover -> grab -> open gripper -> hover; at the end: Home
     Poses are saved in taught_poses.json. Every sequencer move runs through the
     same speed cap, as one straight line in joint space (all joints arrive together).
+    Scan          POST a photo to /api/scan: it goes to the detector service
+                  (detector/locate_service.py, --detector URL), and a valid 3 green + 2 + 1
+                  result becomes the board, with a plan ready for Run.
 
 Only the standard library is needed (plus lerobot when not in --sim).
 """
@@ -41,10 +44,12 @@ import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 
 import sorting
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
@@ -81,6 +86,9 @@ ARRIVE_WAIT = 1.0      # s: longest wait for the arm to catch up after a motion
 STILL_DEG = 0.15       # deg per loop tick: below this the arm counts as not moving
 STILL_S = 0.25         # s: not moving for this long = settled, carry on
 SORT_ALGORITHM = "greedy_simple"   # the one planner the demo uses
+DETECTOR_URL = "http://127.0.0.1:8002"   # detector/locate_service.py
+SCAN_COLORS = "green,yellow,blue,red"    # demo block set
+MAX_SCAN_BYTES = 20 * 2**20
 GRIP_DWELL = 0.6       # s: wait after a gripper command (the block stops the jaw early)
 TORQUE_CHECK_S = 1.0   # s: while the arm is free, re-read Torque_Enable this often and fix it if it came back
 COLOR_RE = re.compile(r"^[a-z]{1,12}$")
@@ -300,6 +308,8 @@ class Controller:
         self.board = {str(n): None for n in range(1, 10)}   # what is in each cell (twin + planner)
         self.holding = None    # colour of the block in the gripper, if any
         self.sort = None       # last plan from sorting.plan(), plus progress
+        self.scan = None       # last scan result (see scan_image)
+        self.detector_url = DETECTOR_URL
         self._torque_checked = 0.0
 
         # Read where the arm actually is BEFORE sending anything, so nothing jumps.
@@ -609,6 +619,58 @@ class Controller:
                      self._arm(c["hover"], f"back over cell {n}")]
             return self._start_program(f"Test cell {n}", steps, allow_teach=True)
 
+    def scan_image(self, data, ctype, source):
+        """Photo -> detector -> board. Valid only with 3 green + 2 + 1 blocks. Returns (code, body)."""
+        with self.lock:
+            if self.program is not None:
+                return 409, {"msg": "Wait for the robot to finish (or press STOP) before scanning."}
+            self.scan = {"busy": True, "ok": False, "source": source, "msg": "Scanning..."}
+        t0 = time.time()
+        url = f"{self.detector_url}/api/detect?colors={SCAN_COLORS}"
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": ctype or "image/jpeg"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                det = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                det = json.loads(e.read())
+            except Exception:
+                det = {"ok": False, "error": f"detector answered HTTP {e.code}"}
+        except (urllib.error.URLError, OSError) as e:
+            msg = (f"Detector not reachable at {self.detector_url}. "
+                   f"Start detector/locate_service.py first. ({getattr(e, 'reason', e)})")
+            with self.lock:
+                self.scan = {"busy": False, "ok": False, "source": source, "msg": msg,
+                             "time": time.strftime("%H:%M:%S")}
+            return 503, {"msg": msg, "scan": self.scan}
+        scan = {"busy": False, "ok": False, "source": source, "time": time.strftime("%H:%M:%S"),
+                "cells": det.get("cells") or {}, "counts": det.get("counts") or {},
+                "warnings": det.get("warnings") or [], "markers": det.get("markers_used") or [],
+                "image_size": det.get("image_size"), "seconds": round(time.time() - t0, 1),
+                "files": det.get("files") or {}}
+        found = ", ".join(f"{n} {c}" for c, n in sorted(scan["counts"].items(), key=lambda kv: -kv[1]))
+        if not det.get("ok"):
+            err = det.get("error") or "the detector could not read the photo"
+            scan["msg"] = f"Scan failed: {err}." + (" Keep all 4 corner markers in view." if "marker" in err else "")
+        else:
+            try:
+                sorting.infer_roles(sorting.normalise_board(scan["cells"]))
+                scan["ok"] = True
+            except sorting.PlanError as e:
+                scan["msg"] = f"{e} Rescan."
+        if scan["ok"]:
+            try:
+                self.set_board(scan["cells"])
+                plan = self.make_plan()
+                scan["msg"] = (f"Found {found}. " + (plan["summary"]["short"] + " Press Run."
+                                                     if plan["moves"] else "Already sorted."))
+            except (ValueError, sorting.PlanError) as e:
+                scan["ok"], scan["msg"] = False, str(e)
+        with self.lock:
+            self.scan = scan
+        return (200 if scan["ok"] else 422), {"msg": scan["msg"], "scan": scan}
+
     def set_board(self, cells):
         clean = {str(n): None for n in range(1, 10)}
         for k, v in (cells or {}).items():
@@ -822,6 +884,7 @@ class Controller:
                 "board": dict(self.board),
                 "holding": self.holding,
                 "sort": self.sort,
+                "scan": self.scan,
                 "poses_version": self.poses_version,
             }
 
@@ -951,6 +1014,13 @@ def make_handler(ctrl):
         def do_POST(self):
             p = urlparse(self.path).path
             n = int(self.headers.get("Content-Length") or 0)
+            if p == "/api/scan":                     # raw JPEG/PNG body, not JSON
+                if n <= 0 or n > MAX_SCAN_BYTES:
+                    return self._json(413 if n > 0 else 400, {"msg": "send one photo (JPEG or PNG, under 20 MB)"})
+                data = self.rfile.read(n)
+                q = parse_qs(urlparse(self.path).query)
+                source = (q.get("source") or ["photo"])[0][:20]
+                return self._json(*ctrl.scan_image(data, self.headers.get("Content-Type"), source))
             try:
                 body = json.loads(self.rfile.read(n) or b"{}")
             except json.JSONDecodeError:
@@ -1019,7 +1089,9 @@ def make_handler(ctrl):
             # ---- sorting demo: board, plan, run ---------------------------------
             if p == "/api/board":
                 try:
-                    return self._json(200, {"board": ctrl.set_board(body.get("cells"))})
+                    board = ctrl.set_board(body.get("cells"))
+                    ctrl.scan = None                 # the board no longer comes from the last scan
+                    return self._json(200, {"board": board})
                 except (ValueError, TypeError, AttributeError) as e:
                     return self._json(400, {"msg": str(e)})
             if p in ("/api/sort/plan", "/api/sort/run"):
@@ -1060,6 +1132,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind address. Keep 127.0.0.1 unless you WANT other machines to move the arm")
     ap.add_argument("--http-port", type=int, default=8000)
+    ap.add_argument("--detector", default=DETECTOR_URL,
+                    help="block detector service for Scan (detector/locate_service.py)")
     args = ap.parse_args()
 
     if args.sim:
@@ -1074,6 +1148,7 @@ def main():
     try:
         os.makedirs(RECORD_DIR, exist_ok=True)
         ctrl = Controller(robot, args.max_speed)
+        ctrl.detector_url = args.detector.rstrip("/")
     except Exception:
         robot.disconnect()
         raise

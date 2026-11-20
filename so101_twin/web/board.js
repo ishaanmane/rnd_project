@@ -7,6 +7,11 @@
 //
 // The blocks come from the server's board state, which the sequencer updates on every pick and
 // place. While the robot holds a block, the block rides on the twin's fingertip.
+//
+// In AR (Sort screen only) the real sheet and blocks are visible through passthrough, so the
+// paper and the virtual cubes are hidden. Drawn instead: a coloured outline around every detected
+// block, the pick/place rings and arrows, and a banner beyond the far edge of the grid with the
+// current move and the reason for it.
 
 const CELL_MM = 60;                       // grid_sheet_60mm.pdf
 const BLOCK_M = 0.025;
@@ -102,12 +107,87 @@ export function initSorting(ctx) {
   if (tip) tip.add(held);
 
   // rings: where the current move picks (orange) and places (green)
-  const ringGeo = new THREE.RingGeometry(0.019, 0.024, 40);
+  const ringGeo = new THREE.RingGeometry(0.022, 0.026, 40);
   const ringSrc = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0xf0b54a, transparent: true, opacity: 0.95, depthWrite: false }));
   const ringDst = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0x3ecf8e, transparent: true, opacity: 0.95, depthWrite: false }));
   for (const r of [ringSrc, ringDst]) { r.rotation.x = -Math.PI / 2; r.position.y = 0.0015; r.visible = false; r.renderOrder = 3; group.add(r); }
 
   const arrows = new THREE.Group(); group.add(arrows);
+
+  // AR: a coloured square outline around each detected block (instead of a virtual cube)
+  const frameShape = new THREE.Shape();
+  frameShape.moveTo(-0.015, -0.015); frameShape.lineTo(0.015, -0.015); frameShape.lineTo(0.015, 0.015); frameShape.lineTo(-0.015, 0.015);
+  const hole = new THREE.Path();
+  hole.moveTo(-0.0125, -0.0125); hole.lineTo(-0.0125, 0.0125); hole.lineTo(0.0125, 0.0125); hole.lineTo(0.0125, -0.0125);
+  frameShape.holes.push(hole);
+  const frameGeo = new THREE.ShapeGeometry(frameShape);
+  const frameMats = {};
+  const frameMat = c => frameMats[c] || (frameMats[c] = new THREE.MeshBasicMaterial({
+    color: COLORS[c] ?? COLORS.block, side: THREE.DoubleSide, depthWrite: false }));
+  const outlines = [];
+  for (let n = 1; n <= 9; n++) {
+    const m = new THREE.Mesh(frameGeo, frameMat('block'));
+    m.rotation.x = -Math.PI / 2; m.position.copy(cellPos(n, 0.002)); m.visible = false; m.renderOrder = 2;
+    group.add(m); outlines.push(m);
+  }
+
+  // AR: banner with the current move and why, floating beyond the far edge of the grid
+  const BW = 0.34, BH = 0.095, BPX = 2400;
+  const bCanvas = document.createElement('canvas');
+  bCanvas.width = BW * BPX; bCanvas.height = BH * BPX;
+  const bTex = new THREE.CanvasTexture(bCanvas); bTex.colorSpace = THREE.SRGBColorSpace;
+  const banner = new THREE.Mesh(new THREE.PlaneGeometry(BW, BH),
+    new THREE.MeshBasicMaterial({ map: bTex, transparent: true, depthTest: false, depthWrite: false }));
+  banner.renderOrder = 23; banner.visible = false;
+  banner.position.set(0, 0.11, -0.16);          // grid frame: up, and past the far row
+  group.add(banner);
+  let bannerKey = '';
+  function drawBanner(title, titleColor, body, foot) {
+    const key = JSON.stringify([title, titleColor, body, foot]);
+    if (key === bannerKey) return;
+    bannerKey = key;
+    const g = bCanvas.getContext('2d'), W = bCanvas.width, H = bCanvas.height, pad = 0.01 * BPX;
+    g.clearRect(0, 0, W, H);
+    g.fillStyle = 'rgba(22,23,28,0.88)'; g.beginPath(); g.roundRect(0, 0, W, H, 0.01 * BPX); g.fill();
+    g.textBaseline = 'top'; g.textAlign = 'left';
+    g.fillStyle = titleColor; g.font = `700 ${0.016 * BPX}px system-ui, sans-serif`;
+    g.fillText(title, pad, pad, W - 2 * pad);
+    g.fillStyle = '#e8e8e8'; g.font = `500 ${0.0115 * BPX}px system-ui, sans-serif`;
+    const words = (body || '').split(' '), lines = [];
+    let line = '';
+    for (const w of words) {                          // simple word wrap
+      const t = line ? line + ' ' + w : w;
+      if (g.measureText(t).width > W - 2 * pad && line) { lines.push(line); line = w; } else line = t;
+    }
+    if (line) lines.push(line);
+    lines.slice(0, 3).forEach((ln, i) => g.fillText(ln, pad, pad + 0.024 * BPX + i * 0.015 * BPX, W - 2 * pad));
+    if (foot) {
+      g.fillStyle = '#4aa3ff'; g.font = `600 ${0.0105 * BPX}px system-ui, sans-serif`;
+      g.fillText(foot, pad, H - pad - 0.0115 * BPX, W - 2 * pad);
+    }
+    bTex.needsUpdate = true;
+  }
+  const KIND_HEX = { home: '#3ecf8e', home_frees: '#4fd1c5', park: '#f0b54a' };
+  function updateBanner(st) {
+    const sort = st.sort, p = st.program, sc = st.scan;
+    if (sc?.busy) return drawBanner('Scanning...', '#4aa3ff', 'Taking a photo and finding the blocks.', '');
+    if (sort && sort.moves.length) {
+      const N = sort.moves.length;
+      // while running: the move the robot is doing (it stays current until the next move starts)
+      const cur = (p?.active && sort.current) ? sort.moves[sort.current - 1] : sort.moves.find(m => m.n > sort.done);
+      if (p?.active && cur) {
+        return drawBanner(`Move ${cur.n} of ${N}: ${cur.color} from cell ${cur.src} to cell ${cur.dst}`,
+                          KIND_HEX[cur.kind] || '#fff', cur.why, p.label.replace(/^Move \d+: /, ''));
+      }
+      if (sort.done >= N) return drawBanner('Sorted', '#3ecf8e', p?.msg || 'All blocks are in their cells.', '');
+      if (cur) return drawBanner(`Plan: ${N} move${N > 1 ? 's' : ''}. Press Run.`, '#e8e8e8',
+                                 `First: ${cur.color} from cell ${cur.src} to cell ${cur.dst}. ${cur.why}`,
+                                 p?.msg && !p.active ? p.msg : '');
+    }
+    if (sc && !sc.ok) return drawBanner('Scan problem', '#ff9f1a', sc.msg, 'Fix it and press Scan again.');
+    if (sc?.ok) return drawBanner('Already sorted', '#3ecf8e', sc.msg, '');
+    drawBanner('Ready to scan', '#e8e8e8', 'Put the arm at Home, look down at the whole sheet, then press Scan.', '');
+  }
 
   function cellPos(n, y = 0) { const [x, z] = cellMM(n); return new THREE.Vector3(x / 1000, y, z / 1000); }
 
@@ -163,7 +243,7 @@ export function initSorting(ctx) {
     fit = { n: P.length, rmsMM: Math.sqrt(err / P.length) * 1000 };
     group.position.set(tx, 0, tz);
     group.rotation.set(0, -th, 0);                       // three.js yaw is the opposite sense of theta in x-z
-    group.visible = true;
+    refreshVisibility();
   }
 
   // ---- panel ----------------------------------------------------------------------
@@ -231,26 +311,66 @@ export function initSorting(ctx) {
         $('gridFit').textContent = fit
           ? `Grid placed from ${fit.n} taught grab pose${fit.n > 1 ? 's' : ''}. Fit error ${fit.rmsMM.toFixed(1)} mm.`
           : 'Teach at least 2 grab poses to show the grid in the twin.';
-        group.visible = !!fit && !renderer.xr.isPresenting;
+        refreshVisibility();
       }).catch(() => { posesVersion = -1; });     // retry on the next poll
     }
     const running = !!st.program?.active;
     for (let n = 1; n <= 9; n++) {
       const c = st.board[String(n)], b = blocks[n - 1], btn = cellBtns[n - 1];
-      b.visible = !!c;
-      if (c) { b.material = matOf(c); b.position.copy(cellPos(n, BLOCK_M / 2 + 0.0008)); }
+      if (c) { b.material = matOf(c); b.position.copy(cellPos(n, BLOCK_M / 2 + 0.0008)); outlines[n - 1].material = frameMat(c); }
       btn.querySelector('.sc').style.background = c ? '#' + (COLORS[c] ?? COLORS.block).toString(16).padStart(6, '0') : 'transparent';
       btn.title = c || 'empty';
       btn.disabled = running;
     }
-    held.visible = !!st.holding;
     if (st.holding) held.material = matOf(st.holding);
     $('sortRun').disabled = $('sortPlan').disabled = $('sortClear').disabled = running;
     renderPlan(st.sort, running);
     const p = st.program;
     $('sortStep').textContent = p?.active ? `${p.label} (${p.step}/${p.count})` : (p?.msg || '');
-    group.visible = !!fit && !renderer.xr.isPresenting;    // AR view of the board comes in a later step
+    const sc = st.scan;
+    $('scanStatus').textContent = sc ? `${sc.time ? sc.time + '  ' : ''}${sc.msg}` : '';
+    $('scanStatus').style.color = !sc ? '' : sc.busy ? 'var(--accent)' : sc.ok ? '#3ecf8e' : '#f0b54a';
+    $('scanBtn').disabled = running || !!sc?.busy;
+    refreshVisibility();
   }
 
-  return { update, group, fitInfo: () => fit };
+  // What is drawn depends on where you look: PC (everything) or AR Sort screen (overlay only).
+  function refreshVisibility() {
+    const inAR = renderer.xr.isPresenting, arSort = inAR && !!ctx.showInAR?.();
+    group.visible = !!fit && (!inAR || arSort);
+    paper.visible = !inAR;
+    const board = state?.board || {};
+    for (let n = 1; n <= 9; n++) {
+      const c = board[String(n)];
+      blocks[n - 1].visible = !inAR && !!c;
+      outlines[n - 1].visible = inAR && !!c;
+    }
+    held.visible = !inAR && !!state?.holding;
+    banner.visible = arSort;
+    if (arSort && state) updateBanner(state);
+  }
+
+  // Every AR frame: keep the banner turned towards your face.
+  function arFrame(head) {
+    if (!banner.visible) return;
+    const p = new THREE.Vector3();
+    head.getWorldPosition(p);
+    banner.lookAt(p);
+  }
+
+  // PC: scan a photo file (for example from a phone) instead of the Quest camera
+  $('scanBtn').onclick = () => $('scanFile').click();
+  $('scanFile').onchange = async e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    say('Scanning ' + f.name + '...');
+    try {
+      const r = await fetch('/api/scan?source=upload', { method: 'POST', headers: { 'Content-Type': f.type || 'image/jpeg' }, body: f });
+      const d = await r.json().catch(() => ({}));
+      say(d.msg || (r.ok ? 'Scanned.' : 'Scan failed.'), !r.ok);
+    } catch (err) { say('Scan failed: ' + err.message, true); }
+  };
+
+  return { update, group, fitInfo: () => fit, arFrame, refreshVisibility };
 }

@@ -85,15 +85,19 @@ A help panel floats just below your line of sight and always shows the next step
 
 | Controller | Hands (wrist bar above the LEFT wrist, poke with the right index finger) | Does |
 |---|---|---|
-| **Y** | **Menu** | Open / close the AR menu |
+| **Y** | **Menu** | Show / hide the menu (the screen you were on: Homepage, Sort or Settings) |
 | **B** | **Holo** | Hologram on / off. Labels and arcs stay, so a replay shows only the motor readings |
 | left stick click | **Labels** | Labels: all -> moving only -> off |
 | point + **trigger** | poke, or point a hand ray + pinch | Press a button on the AR menu |
-| **A** (while a replay runs) | **STOP** (wrist bar, only while a replay runs) | Stop the replay |
+| **A** (while the robot moves) | **STOP** (wrist bar, only while the robot moves) | Stop the replay or the sort |
 | **X** (when not aligning) | **Help** | Hide / show the help panel (remembered). While hidden, a new message still pops up for 4 s |
 
-**The AR menu** opens about 30 degrees to the left of where you are looking, so the robot ahead stays
-visible: your recordings (tap files to select; they play in the order you tap, numbered), **Play**, a red
+**The menu works like a game menu.** When AR starts, the **Homepage** opens with two buttons:
+**Sort** (the sorting demo, see below) and **Settings**. Both screens have a **Homepage** button
+to go back. Menus open about 30 degrees to the left of where you are looking, so the robot ahead
+stays visible.
+
+**Settings** is the AR menu: your recordings (tap files to select; they play in the order you tap, numbered), **Play**, a red
 **STOP**, speed **- / +**, **Help panel**, **Hologram**, **Labels**, **Realign...** and **Forget...**. The
 status line at the bottom shows the replay in progress. **Play closes the menu** so it is out of your way;
 press Y (or Menu) to bring it back, and A (or the wrist bar's STOP) stops the replay.
@@ -182,8 +186,25 @@ Gripper values (teach, open, grip, home) can be changed on the same page without
 
 ### 2. Run
 
-In the twin's **Sorting demo** panel: click cells to set the board, then
-**Plan** (shows the moves and why) or **Run**. Every move is:
+Two terminals:
+
+```bash
+# 1: the robot (lerobot env)
+python twin_server.py --port /dev/ttyACM0 --id asherbot --http-port 8001
+# 2: the block detector (locany env), needed for Scan
+cd detector && python locate_service.py
+```
+
+**In AR (Quest):** on the 2D page press **Allow camera (for Scan in AR)** once, then Enter AR.
+Homepage > **Sort**. The hologram turns off (B brings it back). With the arm at Home, look down
+at the whole sheet and press **Scan**: the headset camera takes one photo, the detector finds the
+blocks, and each detected block gets a coloured outline on the real grid. The next move shows as
+an orange ring (pick), a green ring (place) and an arrow; a banner beyond the far edge of the grid
+says the move and why. Check the outlines, then press **Run**. STOP: the panel, A, or the wrist bar.
+A scan is refused unless it finds 3 green + 2 + 1 blocks (then rescan).
+
+**On the PC:** set the board by clicking cells, or **Scan photo…** (for example a phone photo
+taken from above), then **Plan** (shows the moves and why) or **Run**. Every move is:
 
     pick:  hover -> grab -> gripper to 15 % -> hover
     place: hover -> grab -> gripper to 19.5 % -> hover

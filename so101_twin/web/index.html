@@ -161,6 +161,8 @@
     </div>
     <button id="arBtn" style="width:100%;margin-top:8px" disabled>Checking AR support…</button>
     <div class="note" id="arNote"></div>
+    <button id="camBtn" style="width:100%;margin-top:6px;display:none">Allow camera (for Scan in AR)</button>
+    <div class="note" id="camNote"></div>
 
     <h2>Max speed</h2>
     <div class="row">
@@ -201,6 +203,11 @@
       <a href="/teach" style="flex:1"><button style="width:100%">Teach poses…</button></a>
     </div>
     <div class="note" id="sortRoles"></div>
+    <div class="row" style="margin-top:6px">
+      <button id="scanBtn" style="flex:1" title="Detect the blocks in a photo (needs detector/locate_service.py running)">Scan photo…</button>
+      <input id="scanFile" type="file" accept="image/*" hidden>
+    </div>
+    <div class="note" id="scanStatus"></div>
     <div id="sortSummary"></div>
     <div id="sortStep"></div>
     <ol id="sortList"></ol>
@@ -242,6 +249,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import URDFLoader from 'urdf-loader';
 import { PointerURDFDragControls } from 'urdf-drag';
 import { initSorting } from '/board.js';
+import { cameraSupported, allowCamera, cameraPermission, captureJPEG } from '/questcam.js';
 
 const JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
 const UNIT = j => j === 'gripper' ? '%' : '°';
@@ -712,7 +720,8 @@ async function poll() {
 let sortingUI = null;
 async function maybeStart() {
   if (!actualBot || !cfg) return;
-  sortingUI = initSorting({ THREE, twinRoot, actualBot, toRad, api, say, renderer, cfg });
+  sortingUI = initSorting({ THREE, twinRoot, actualBot, toRad, api, say, renderer, cfg,
+                           showInAR: () => ar.screen === 'sort' });
   window.twin.sorting = sortingUI;   // handy in the devtools console
   for (const j of JOINTS) {
     ghostJ[j].setJointValue(toRad(j, target[j]));
@@ -804,6 +813,10 @@ const ar = {
   menuOpen: false,
   confirm: { id: null, until: 0 },    // "tap again to confirm" for Realign / Forget
   rec: { files: [], pick: [], page: 0, loaded: false },
+  screen: 'home',                     // AR menu screen: 'home' (Sort / Settings), 'settings', 'sort'
+  openOnStart: false,                 // show the homepage on the first AR frame
+  holoBeforeSort: null,               // hologram state to restore when leaving the Sort screen
+  scanBusy: false, camNote: '',       // Scan with the Quest camera
 };
 try { ar.holo = localStorage.getItem('so101-twin-holo') !== '0'; } catch {}
 try { ar.hud = localStorage.getItem('so101-twin-help') !== '0'; } catch {}
@@ -1187,6 +1200,7 @@ function tryRestoreAnchor(session) {
 // ---- twin look -----------------------------------------------------------------------------
 function toggleHolo() {
   ar.holo = !ar.holo;
+  ar.holoBeforeSort = null;                  // the user chose: do not restore an older state later
   try { localStorage.setItem('so101-twin-holo', ar.holo ? '1' : '0'); } catch {}
   applyLook();
   ar.note = ar.holo ? 'Hologram on' : 'Hologram off (labels stay)';
@@ -1257,7 +1271,7 @@ function pollInputs(session, dt) {
     if (h === 'right') {
       edge('A', btn(4), () => {
         if (ar.editing) return commitEdit();
-        if (state?.replay?.active) { doStop(); ar.note = 'Replay stopped.'; return; }   // A = STOP during a replay
+        if (state?.replay?.active || state?.program?.active) { doStop(); ar.note = 'Stopped.'; return; }   // A = STOP while the robot moves
         return ar.aligned ? lockedNote() : beginEdit();
       });
       edge('R3', btn(3), () => {
@@ -1527,7 +1541,7 @@ const wristBar = new ARPanel(0.24, 0.04, { px: 7500, bg: false });
 panels.push(wristBar);
 function wristItems() {
   const ids = ar.editing ? ['done', 'cancel', 'tune', 'holo']
-            : state?.replay?.active ? ['stop', 'menu', 'holo', 'labels']
+            : (state?.replay?.active || state?.program?.active) ? ['stop', 'menu', 'holo', 'labels']
             : !ar.aligned ? ['align', 'menu', 'holo', 'help']
             : ['menu', 'holo', 'labels', 'help'];
   const names = { done: 'Done', cancel: 'Cancel', tune: 'Tune', holo: ar.holo ? 'Holo on' : 'Holo off', stop: 'STOP',
@@ -1565,24 +1579,125 @@ async function loadRecordings() {
     ar.rec.loaded = true;
   } catch { ar.note = 'Could not load recordings.'; }
 }
+// Game-style menu with three screens. Homepage: Sort / Settings. Settings: the AR menu below.
+// Sort: the sorting demo. Only one screen panel is visible at a time; switching keeps its place.
+const HOME_W = 0.30, HOME_H = 0.16;
+const homePanel = new ARPanel(HOME_W, HOME_H, { px: 3000 });
+panels.push(homePanel);
+const SORT_W = 0.38, SORT_H = 0.34;          // room for 9 moves, the most Greedy (simple) ever needs
+const sortPanel = new ARPanel(SORT_W, SORT_H, { px: 3000 });
+panels.push(sortPanel);
+const menuPanels = () => [homePanel, arMenu, sortPanel];
+function screenPanel(s = ar.screen) { return s === 'settings' ? arMenu : s === 'sort' ? sortPanel : homePanel; }
 function openMenu() {
   const head = renderer.xr.getCamera();
   head.getWorldPosition(_p); head.getWorldQuaternion(_q);
   _f.set(0, 0, -1).applyQuaternion(_q); _f.y = 0; _f.normalize();
   _f.applyAxisAngle(_up, 0.55);                             // ~30 deg to your LEFT, so the robot ahead stays visible
-  arMenu.mesh.position.copy(_p).addScaledVector(_f, 0.45); arMenu.mesh.position.y -= 0.15;   // arm's reach, a bit low
-  arMenu.mesh.lookAt(_p);
-  arMenu.mesh.visible = true; ar.menuOpen = true;
-  loadRecordings();
+  const m = screenPanel().mesh;
+  m.position.copy(_p).addScaledVector(_f, 0.45); m.position.y -= 0.15;   // arm's reach, a bit low
+  m.lookAt(_p);
+  m.visible = true; ar.menuOpen = true;
+  if (ar.screen === 'settings') loadRecordings();
 }
-function closeMenu() { arMenu.mesh.visible = false; ar.menuOpen = false; ar.confirm.id = null; }
+function closeMenu() { for (const p of menuPanels()) p.mesh.visible = false; ar.menuOpen = false; ar.confirm.id = null; }
+function enterSort() {                                      // hologram off while sorting (B still toggles it)
+  ar.holoBeforeSort = ar.holo;
+  if (ar.holo) { ar.holo = false; applyLook(); }
+  sortingUI?.refreshVisibility();
+}
+function leaveSort() {
+  if (ar.holoBeforeSort !== null) { ar.holo = ar.holoBeforeSort; applyLook(); }
+  ar.holoBeforeSort = null;
+  sortingUI?.refreshVisibility();
+}
+function goScreen(s) {
+  const old = screenPanel().mesh, wasOpen = old.visible;
+  const pos = old.position.clone(), quat = old.quaternion.clone();
+  for (const p of menuPanels()) p.mesh.visible = false;
+  if (ar.screen === 'sort' && s !== 'sort') leaveSort();
+  const entering = ar.screen !== 'sort' && s === 'sort';
+  ar.screen = s; ar.confirm.id = null; ar.note = '';
+  if (entering) enterSort();
+  if (!wasOpen) return openMenu();
+  const m = screenPanel().mesh;
+  m.position.copy(pos); m.quaternion.copy(quat); m.visible = true; ar.menuOpen = true;
+  if (s === 'settings') loadRecordings();
+}
+
+function homeItems() {
+  const I = [];
+  I.push({ t: 'SO-101 Digital Twin', x: 0.015, y: 0.022, size: 0.014, b: true });
+  I.push({ btn: true, id: 'goSort', label: 'Sort', x: 0.015, y: 0.04, w: 0.13, h: 0.078, size: 0.022 });
+  I.push({ btn: true, id: 'goSettings', label: 'Settings', x: 0.155, y: 0.04, w: 0.13, h: 0.078, size: 0.022 });
+  const st = ar.note || (!ar.aligned ? 'Not aligned yet: open Settings and align first.'
+                                     : 'Y (or wrist bar Menu) opens and closes this menu.');
+  I.push({ t: st, x: 0.015, y: 0.14, size: 0.0095, c: ar.aligned || ar.note ? '#8a8d99' : '#ff9f1a' });
+  return I;
+}
+
+const KIND_NAME = { home: 'home', home_frees: 'home, frees a cell', park: 'park (loop)' };
+const KIND_HEX = { home: '#3ecf8e', home_frees: '#4fd1c5', park: '#f0b54a' };
+function sortItems() {
+  const I = [], sort = state?.sort, prog = state?.program, sc = state?.scan;
+  const running = !!prog?.active, busy = ar.scanBusy || !!sc?.busy;
+  I.push({ t: 'Sorting demo', x: 0.015, y: 0.021, size: 0.014, b: true });
+  I.push({ btn: true, id: 'homepage', label: 'Homepage', x: SORT_W - 0.087, y: 0.006, w: 0.077, h: 0.028, size: 0.0105 });
+  I.push({ btn: true, id: 'scan', label: busy ? 'Scanning...' : 'Scan', x: 0.015, y: 0.045, w: 0.085, h: 0.04, disabled: running || busy });
+  I.push({ btn: true, id: 'run', label: 'Run', x: 0.105, y: 0.045, w: 0.085, h: 0.04,
+           disabled: running || busy || !sort?.moves?.length || sort.done >= sort.moves.length });
+  I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.195, y: 0.045, w: 0.085, h: 0.04, danger: true });
+  I.push({ btn: true, id: 'armHome', label: 'Arm Home', x: 0.285, y: 0.045, w: 0.08, h: 0.04, size: 0.0125, disabled: running });
+  // status: scan result, camera info, what the robot is doing
+  const scanLine = ar.scanBusy ? (ar.camNote || 'Taking a photo...') : sc?.busy ? 'Finding the blocks...' : (sc?.msg || ar.note ||
+                   (ar.aligned ? 'Arm at Home, look down at the whole sheet, press Scan.' : 'Not aligned: Homepage > Settings > Align.'));
+  I.push({ t: scanLine, x: 0.015, y: 0.103, size: 0.0098,
+           c: busy ? '#4aa3ff' : sc ? (sc.ok ? '#3ecf8e' : '#ff9f1a') : '#8a8d99' });
+  if (ar.camNote && !ar.scanBusy) I.push({ t: ar.camNote, x: 0.015, y: 0.122, size: 0.0085, c: '#8a8d99' });
+  let doing = '';
+  if (running) doing = `${prog.label}  (${prog.step}/${prog.count})`;
+  else if (sort?.moves?.length) doing = sort.done >= sort.moves.length ? (prog?.msg || 'Sorted.')
+                                      : (sc?.ok ? '' : `${sort.summary.short} Press Run.`);   // a good scan already says it
+  else if (prog?.msg) doing = prog.msg;
+  I.push({ t: doing, x: 0.015, y: 0.143, size: 0.0105, b: true, c: '#4aa3ff' });
+  // the plan, one line per move
+  const moves = sort?.moves || [];
+  moves.slice(0, 9).forEach((m, i) => {
+    const cur = running && m.n === sort.current;          // the move the robot is doing right now
+    const done = m.n <= sort.done && !cur;
+    const y = 0.168 + i * 0.019;
+    I.push({ t: `${m.n}.  ${m.color}  ${m.src} \u2192 ${m.dst}`, x: 0.02, y, size: 0.0105, b: cur,
+             c: done ? '#6b6e78' : cur ? '#4aa3ff' : '#e8e8e8', maxW: 0.17 });
+    I.push({ t: done ? 'done' : KIND_NAME[m.kind] || m.kind, x: 0.2, y, size: 0.0095,
+             c: done ? '#6b6e78' : KIND_HEX[m.kind] || '#8a8d99', maxW: 0.165 });
+  });
+  return I;
+}
+
+async function arScan() {
+  if (ar.scanBusy) return;
+  ar.scanBusy = true; ar.camNote = 'Taking a photo...'; ar.note = '';
+  try {
+    const shot = await captureJPEG();
+    const info = `${shot.label} \u00b7 ${shot.width}\u00d7${shot.height}`;
+    ar.camNote = info + ' \u00b7 finding the blocks...';
+    const t0 = performance.now();
+    const r = await fetch('/api/scan?source=quest', { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: shot.blob });
+    const d = await r.json().catch(() => ({}));
+    ar.camNote = `${info} \u00b7 ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    if (!r.ok && !d.scan) ar.note = d.msg || 'Scan failed.';
+  } catch (e) {
+    ar.camNote = 'Camera error: ' + (e.name && e.name !== 'Error' ? e.name + ': ' : '') + e.message;
+    ar.note = 'No camera in AR. Use "Scan photo" on the PC page instead.';
+  } finally { ar.scanBusy = false; }
+}
 
 function menuItems(now) {
   const I = [];
   const R = state?.replay, playing = !!R?.active, rec = ar.rec;
-  I.push({ t: 'SO-101  ·  AR menu', x: 0.015, y: 0.021, size: 0.014, b: true });
-  I.push({ btn: true, id: 'help', label: ar.hud ? 'Help panel: on' : 'Help panel: off', x: MENU_W - 0.172, y: 0.006, w: 0.1, h: 0.028, size: 0.0105 });
-  I.push({ btn: true, id: 'close', label: 'Close', x: MENU_W - 0.067, y: 0.006, w: 0.057, h: 0.028, size: 0.011 });
+  I.push({ t: 'Settings', x: 0.015, y: 0.021, size: 0.014, b: true });
+  I.push({ btn: true, id: 'help', label: ar.hud ? 'Help panel: on' : 'Help panel: off', x: MENU_W - 0.192, y: 0.006, w: 0.1, h: 0.028, size: 0.0105 });
+  I.push({ btn: true, id: 'homepage', label: 'Homepage', x: MENU_W - 0.087, y: 0.006, w: 0.077, h: 0.028, size: 0.0105 });
   I.push({ t: 'REPLAY  (tap files: they play in the order you tap)', x: 0.015, y: 0.049, size: 0.0085, c: '#8a8d99', b: true });
   const files = rec.files, pages = Math.max(1, Math.ceil(files.length / ROWS));
   const page = files.slice(rec.page * ROWS, rec.page * ROWS + ROWS);
@@ -1629,6 +1744,12 @@ function menuItems(now) {
 // what every button does
 Object.assign(actions, {
   close: closeMenu,
+  homepage: () => goScreen('home'),
+  goSort: () => goScreen('sort'),
+  goSettings: () => goScreen('settings'),
+  scan: arScan,
+  run: async () => { const r = await api('/api/sort/run', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not start'); },
+  armHome: async () => { const r = await api('/api/go_home', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not move'); },
   menu: () => (ar.menuOpen ? closeMenu() : openMenu()),
   up: () => { ar.rec.page = Math.max(0, ar.rec.page - 1); },
   down: () => { ar.rec.page = ar.rec.page + 1; },
@@ -1882,6 +2003,11 @@ function updateHud(head) {
     L.push(H ? '1. Pinch: drop the twin near the real base' : '1. Trigger: drop the twin near the real base');
     L.push(H ? '2. Wrist bar > Align: move the glowing motor onto the real one' : `2. A: align by the ${ALIGN_MOTOR.name} motor`);
     L.push({ t: H ? 'Wrist bar: poke with your right index finger' : 'Y: menu · B: hologram on/off · X: hide this panel', c: '#8a8d99' });
+  } else if (ar.screen === 'sort') {
+    L.push({ t: 'Sorting demo', b: true, c: '#3ecf8e' });
+    L.push(H ? 'Wrist bar Menu: Scan, Run, STOP. Wrist bar STOP while the robot moves.'
+             : 'Y: sort panel (Scan, Run, STOP) · A: STOP while the robot moves · B: hologram');
+    if (state?.scan?.msg) L.push({ t: state.scan.msg, c: state.scan.ok ? '#3ecf8e' : '#ff9f1a' });
   } else {
     L.push({ t: 'Aligned and locked' + (ar.anchor ? (ar.persisted ? ' · saved for next time' : ' · this session only') : ''),
              b: true, c: '#3ecf8e' });
@@ -1905,7 +2031,9 @@ function arFrame(frame, dt) {
   updateDrag(head);
   updateDwell(now, head);
   updateWristBar(head);
-  if (ar.menuOpen) arMenu.set(menuItems(now));
+  if (ar.openOnStart && head.position.lengthSq() > 0) { ar.openOnStart = false; openMenu(); }
+  if (ar.menuOpen) screenPanel().set(ar.screen === 'settings' ? menuItems(now) : ar.screen === 'sort' ? sortItems() : homeItems());
+  sortingUI?.arFrame(head);
   updatePanels(now);
   updatePointer();
   updateOverlays(head, now);
@@ -1946,7 +2074,8 @@ async function setupARButton() {
   try { ok = await navigator.xr.isSessionSupported('immersive-ar'); } catch {}
   if (!ok) return unavailable('This device does not support immersive AR (normal on a desktop browser).');
   btn.disabled = false; btn.textContent = 'Enter AR';
-  note.textContent = 'In AR: Y (or the wrist bar) opens the AR menu: replay, hologram on/off, labels, realign. ' +
+  setupCameraButton();
+  note.textContent = 'In AR: the homepage opens (Sort / Settings). Y or the wrist bar Menu shows and hides it. ' +
                      'A help panel floats below your view. Press the Meta button to exit.';
   btn.onclick = async () => {
     if (renderer.xr.isPresenting) { renderer.xr.getSession().end(); return; }
@@ -1960,6 +2089,25 @@ async function setupARButton() {
   };
 }
 
+// Scan in AR uses the headset camera. The Quest asks for camera permission the first time, and if
+// that happens inside AR it leaves AR to show the prompt. So: allow it here first, on the 2D page.
+async function setupCameraButton() {
+  const btn = $('camBtn'), note = $('camNote');
+  if (!cameraSupported()) { note.textContent = 'This browser has no camera API: Scan in AR will not work (use Scan photo on the PC).'; return; }
+  btn.style.display = '';
+  if (await cameraPermission() === 'granted') { btn.textContent = 'Camera allowed (test again)'; note.textContent = 'Scan in AR can use the headset camera.'; }
+  btn.onclick = async () => {
+    note.textContent = 'Asking for the camera...';
+    try {
+      const labels = await allowCamera();
+      btn.textContent = 'Camera allowed (test again)';
+      note.textContent = 'Camera allowed. Found: ' + labels.join('; ');
+    } catch (e) {
+      note.textContent = `No camera: ${e.name || 'Error'}: ${e.message}`;
+    }
+  };
+}
+
 renderer.xr.addEventListener('sessionstart', () => {
   scene.background = null;                // transparent clear = passthrough
   grid.visible = false;
@@ -1968,9 +2116,11 @@ renderer.xr.addEventListener('sessionstart', () => {
   Object.assign(ar, { mode: 'free', aligned: false, captured: [], anchor: null, anchorPending: false,
                       tuning: false, quality: '', note: '', placeOnNextFrame: true,
                       tuneMode: false, drag: null, poke: { armed: false, until: 0 }, persisted: false,
-                      editing: false, editBackup: null, menuOpen: false, confirm: { id: null, until: 0 } });
+                      editing: false, editBackup: null, menuOpen: false, confirm: { id: null, until: 0 },
+                      screen: 'home', openOnStart: true, holoBeforeSort: null, scanBusy: false, camNote: '' });
   Object.assign(ar.dwell, { pos: null, n: 0, armed: true, last: null });
-  wristBar.placed = false; arMenu.mesh.visible = false;
+  wristBar.placed = false;
+  for (const p of menuPanels()) p.mesh.visible = false;
   applyLook();
   ar.buttons.clear();
   hud.userData.placed = false;
@@ -1982,7 +2132,10 @@ renderer.xr.addEventListener('sessionstart', () => {
 renderer.xr.addEventListener('sessionend', () => {
   scene.background = new THREE.Color(0x16171c);
   grid.visible = true;
-  hud.visible = false; wristBar.mesh.visible = false; arMenu.mesh.visible = false; pointerDot.visible = false; dwellRing.visible = false;
+  hud.visible = false; wristBar.mesh.visible = false; pointerDot.visible = false; dwellRing.visible = false;
+  if (ar.screen === 'sort') leaveSort();
+  for (const p of menuPanels()) p.mesh.visible = false;
+  ar.screen = 'home';
   ar.editing = false; ar.editBackup = null; ar.menuOpen = false;
   setLiftGlow(false);
   hideOverlays();
@@ -1995,7 +2148,7 @@ renderer.xr.addEventListener('sessionend', () => {
   say('AR session ended');
 });
 setupARButton();
-window.twinAR = { ar, CAL_PTS, hud, wristBar, arMenu, hands, liftCenter, arControllers, overlay, motion, labelModes: LABEL_MODES, getLabelMode: () => labelMode, getSample: () => ({ last: lastSample, t: lastSampleT, same: lastSample === state, cur: state && state.actual }) };   // handy in the devtools console (chrome://inspect)
+window.twinAR = { ar, CAL_PTS, hud, wristBar, arMenu, homePanel, sortPanel, goScreen, openMenu, closeMenu, actions, hands, liftCenter, arControllers, overlay, motion, labelModes: LABEL_MODES, getLabelMode: () => labelMode, getSample: () => ({ last: lastSample, t: lastSampleT, same: lastSample === state, cur: state && state.actual }) };   // handy in the devtools console (chrome://inspect)
 
 // ---------------------------------------------------------------- render loop
 let lastT = 0;
