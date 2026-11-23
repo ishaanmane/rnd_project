@@ -270,16 +270,29 @@ export function initSorting(ctx) {
   $('sortPlan').onclick = async () => {
     const r = await api('/api/sort/plan', {}); say(r.data.msg, !r.ok);
   };
+  // The server keeps the planner choice (the AR menu can change it too). Changing it re-plans.
+  // While you are using the dropdown (and 2 s after), the poll does not overwrite it.
+  let algTouched = 0;
+  const touchAlg = () => { algTouched = performance.now(); };
+  $('sortAlg').addEventListener('pointerdown', touchAlg);
+  $('sortAlg').addEventListener('keydown', touchAlg);
+  $('sortAlg').onchange = async (e) => {
+    touchAlg();
+    const r = await api('/api/sort/algorithm', { algorithm: e.target.value }); say(r.data.msg, !r.ok);
+  };
   $('sortRun').onclick = async () => {
     const r = await api('/api/sort/run', {}); say(r.data.msg, !r.ok);
   };
   $('sortHome').onclick = async () => { const r = await api('/api/go_home', {}); say(r.data.msg, !r.ok); };
 
   function renderPlan(sort, running) {
-    const key = JSON.stringify([sort?.moves?.length, sort?.start, sort?.current, sort?.done, running]);
+    // The moves themselves are in the key: BFS and Dijkstra can give the same count in another order.
+    const key = JSON.stringify([sort?.algorithm, sort?.moves?.map(m => [m.src, m.dst]), sort?.start,
+                                sort?.current, sort?.done, sort?.measured_s, running]);
     if (key === planKey) return;
     planKey = key;
-    $('sortSummary').textContent = sort ? sort.summary.short : 'No plan yet. Set the board, then Plan or Run.';
+    $('sortSummary').textContent = !sort ? 'No plan yet. Set the board, then Plan or Run.'
+      : sort.summary.text + (sort.measured_s ? ` Measured: ${sort.measured_s.toFixed(1)} s.` : '');
     const ol = $('sortList'); ol.innerHTML = '';
     arrows.clear();
     if (!sort) return;
@@ -323,7 +336,8 @@ export function initSorting(ctx) {
       btn.disabled = running;
     }
     if (st.holding) held.material = matOf(st.holding);
-    $('sortRun').disabled = $('sortPlan').disabled = $('sortClear').disabled = running;
+    $('sortRun').disabled = $('sortPlan').disabled = $('sortClear').disabled = $('sortAlg').disabled = running;
+    if (st.sort_algorithm && performance.now() - algTouched > 2000) $('sortAlg').value = st.sort_algorithm;
     renderPlan(st.sort, running);
     const p = st.program;
     $('sortStep').textContent = p?.active ? `${p.label} (${p.step}/${p.count})` : (p?.msg || '');

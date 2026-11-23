@@ -34,6 +34,21 @@ Sorting demo (see sorting.py and web/teach.html):
                   (detector/locate_service.py, --detector URL), and a valid 3 green + 2 + 1
                   result becomes the board, with a plan ready for Run.
 
+Payload experiment (see payload_model.py):
+    poses         its own file, payload_poses.json (the sorting poses are never touched):
+                  hover, grab, lift, left, right over the container in cell 2, plus the
+                  payload gripper open/grip values. Home is shared with sorting.
+    test          Home -> hover -> grab -> close -> hover -> lift -> HOLD 5 s -> left -> right
+                  -> lift -> hover -> grab -> open -> hover -> Home, at 10, 20 or 30 deg/s.
+                  left/right: only their shoulder_pan is used, so only the base motor moves.
+                  HOLD passes if every arm joint stays within HOLD_TOL of lift, no servo
+                  flags overload and the container does not slip; else the dance is skipped.
+    telemetry     the control loop reads Present_Load / Present_Current / Status /
+                  Temperature / Voltage from the real servos (one register per tick).
+    prediction    static gravity torque from the URDF for the pose the arm is in (+ payload).
+    RELEASE       POST /api/payload/release: stop, freeze the arm, open the gripper at once.
+    logs          payload_runs/<time>_<mass>g_<speed>dps.csv (every tick) + summary.csv.
+
 Only the standard library is needed (plus lerobot when not in --sim).
 """
 
@@ -47,6 +62,7 @@ import time
 import urllib.error
 import urllib.request
 
+import payload_model
 import sorting
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -77,7 +93,6 @@ DEFAULT_HOME = {"shoulder_pan": 1.2, "shoulder_lift": -1.3, "elbow_flex": 0.3,
 # Gripper % values: teach = held while teaching, open = release / approach,
 # grip = close on a block, home = at the Home pose.
 DEFAULT_GRIPPER = {"teach": 19.5, "open": 19.5, "grip": 15.0, "home": 1.0}
-SLOT_RE = re.compile(r"^(home|[1-9]\.(hover|grab))$")
 ARRIVE_TOL = 3.0       # deg: a pose counts as reached when every arm joint is this close
 # The sequencer never stops for a missed pose (servos can sit a few degrees off, and this setup
 # has no collisions). After a motion it waits for the arm to catch up, but only until the arm
@@ -85,13 +100,33 @@ ARRIVE_TOL = 3.0       # deg: a pose counts as reached when every arm joint is t
 ARRIVE_WAIT = 1.0      # s: longest wait for the arm to catch up after a motion
 STILL_DEG = 0.15       # deg per loop tick: below this the arm counts as not moving
 STILL_S = 0.25         # s: not moving for this long = settled, carry on
-SORT_ALGORITHM = "greedy_simple"   # the one planner the demo uses
+SORT_ALGORITHM = "greedy_simple"   # the planner chosen at start-up
+# Planners the demo menus offer (see sorting.py). The choice is kept by the server, so a scan,
+# Plan and Run all use the same one, and the 2D page and the AR menu always agree.
+DEMO_ALGORITHMS = {"greedy_simple": "Greedy", "bfs": "BFS", "dijkstra": "Dijkstra"}
+SORT_LOG = os.path.join(HERE, "sort_runs.csv")   # one line per finished Sort: predicted vs measured time
 DETECTOR_URL = "http://127.0.0.1:8002"   # detector/locate_service.py
 SCAN_COLORS = "green,yellow,blue,red"    # demo block set
 MAX_SCAN_BYTES = 20 * 2**20
 GRIP_DWELL = 0.6       # s: wait after a gripper command (the block stops the jaw early)
 TORQUE_CHECK_S = 1.0   # s: while the arm is free, re-read Torque_Enable this often and fix it if it came back
 COLOR_RE = re.compile(r"^[a-z]{1,12}$")
+
+# ---- payload experiment ---------------------------------------------------------
+PAYLOAD_FILE = os.path.join(HERE, "payload_poses.json")   # separate from taught_poses.json
+PAYLOAD_DIR = os.path.join(HERE, "payload_runs")          # one CSV per run + summary.csv
+PAYLOAD_SLOTS = ("hover", "grab", "lift", "left", "right")
+PAYLOAD_MASSES_G = (0, 100, 200, 300, 400, 500)           # hammer heads in the container
+PAYLOAD_SPEEDS = (10.0, 20.0, 30.0)                       # deg/s, every motor
+HOLD_S = 5.0           # s: the arm must hold the lift pose this long
+HOLD_TOL = 5.0         # deg: largest allowed error on any arm joint during the hold
+SLIP_PCT = 3.0         # gripper %: closing this much further during the hold = the container slipped
+LOAD_WARN, LOAD_HIGH = 50.0, 80.0    # % of full load: amber from 50, red from 80 (both pages use these)
+STATUS_BITS = {0: "voltage", 1: "encoder", 2: "overheat", 3: "overcurrent", 5: "overload"}  # Status reg 65
+TELEMETRY_CYCLE = ("Present_Load", "Present_Current", "Status", "Present_Load", "Present_Current", "slow")
+TELEMETRY_SLOW = ("Present_Temperature", "Present_Voltage")   # alternate in the "slow" slot
+TELEMETRY_MAX_FAILS = 30   # consecutive failed reads: switch telemetry off rather than disturb control
+SLOT_RE = re.compile(r"^(home|[1-9]\.(hover|grab)|payload\.(hover|grab|lift|left|right))$")
 
 
 def load_poses():
@@ -124,6 +159,45 @@ def save_poses(poses):
     with open(tmp, "w") as f:
         json.dump(poses, f, indent=1)
     os.replace(tmp, POSES_FILE)      # atomic: a crash never leaves half a file
+
+
+def _fmt(v, nd=1):
+    return "" if v is None else f"{v:.{nd}f}"
+
+
+def _flags(status):
+    """Status register (65) -> names of the protection bits that are set."""
+    if not status:
+        return []
+    return [name for bit, name in STATUS_BITS.items() if int(status) >> bit & 1]
+
+
+def load_payload():
+    """payload_poses.json -> {"poses": {slot: pose}, "gripper": {"open", "grip"} or None,
+    "container_g": float or None, "taught": {}}. Nothing is invented: unset stays None/missing."""
+    try:
+        with open(PAYLOAD_FILE) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    out = {"poses": {}, "gripper": None, "container_g": None, "taught": dict(data.get("taught") or {})}
+    for slot in PAYLOAD_SLOTS:
+        pose = (data.get("poses") or {}).get(slot)
+        if isinstance(pose, dict) and all(j in pose for j in ARM):
+            out["poses"][slot] = {j: float(pose[j]) for j in ARM}
+    g = data.get("gripper")
+    if isinstance(g, dict) and "open" in g and "grip" in g:
+        out["gripper"] = {k: min(max(float(g[k]), 0.0), 100.0) for k in ("open", "grip")}
+    if data.get("container_g") is not None:
+        out["container_g"] = max(float(data["container_g"]), 0.0)
+    return out
+
+
+def save_payload(payload):
+    tmp = PAYLOAD_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=1)
+    os.replace(tmp, PAYLOAD_FILE)
 
 
 def motion_path(name, default_if_empty=False):
@@ -308,10 +382,28 @@ class Controller:
         self.board = {str(n): None for n in range(1, 10)}   # what is in each cell (twin + planner)
         self.holding = None    # colour of the block in the gripper, if any
         self.sort = None       # last plan from sorting.plan(), plus progress
+        self.sort_alg = SORT_ALGORITHM   # planner used by scan, Plan and Run (one of DEMO_ALGORITHMS)
         self.scan = None       # last scan result (see scan_image)
         self.detector_url = DETECTOR_URL
         self.keep_scans = False   # False: a scan's photo is deleted when its sort finishes or a new scan replaces it
         self._torque_checked = 0.0
+
+        # payload experiment
+        self.ppl = load_payload()      # payload poses / gripper / container mass (payload_poses.json)
+        self.payload = {"status": "idle", "msg": "", "mass_g": None, "speed": None, "hold": None,
+                        "precheck": None, "file": "", "result": None}
+        self.payload_held = False      # container in the gripper (adds its mass to the prediction)
+        self.payload_log = None        # open CSV file while a payload test runs
+        try:
+            self.model = payload_model.GravityModel(os.path.join(URDF_ROOT, "so101.urdf"), load_twin_calib())
+        except (OSError, ValueError, KeyError, AttributeError) as e:   # no URDF: run without prediction
+            self.model = None
+            print(f"[payload] gravity model unavailable: {e}")
+        bus = getattr(robot, "bus", None)
+        self.telemetry_on = bus is not None and hasattr(bus, "sync_read")   # real servos only
+        self.tel = {"load": {}, "current": {}, "status": {}, "temp": {}, "volt": {}, "t": 0.0, "err": "", "fails": 0}
+        self._tel_i = 0
+        self._tel_slow = 0
 
         # Read where the arm actually is BEFORE sending anything, so nothing jumps.
         obs = robot.get_observation()
@@ -354,8 +446,12 @@ class Controller:
             return ""
 
     def set_speed(self, v):
+        """False while a payload test runs: its speed mode is part of the experiment."""
         with self.lock:
+            if self.program is not None and self.program.get("payload"):
+                return False
             self.speed = min(max(float(v), 1.0), SPEED_CEILING)
+            return True
 
     def stop(self):
         with self.lock:
@@ -367,6 +463,9 @@ class Controller:
                 label = p["steps"][min(p["i"], len(p["steps"]) - 1)]["label"]
                 self.program_msg = f"{p['name']} stopped at: {label}"
                 self.program = None
+                if p.get("payload"):
+                    self._payload_end(p, "STOPPED", f"Stopped at: {label}. The container is still in the gripper."
+                                      if self.payload_held else f"Stopped at: {label}.")
             self.target = dict(self.cmd)
             arm_free = bool(self.teach and self.teach["free"])
         if arm_free:                               # STOP while teaching = torque back on, nothing saved
@@ -436,6 +535,13 @@ class Controller:
     def _save_slot(self, slot, pose):
         """Lock held by caller."""
         pose = {j: round(pose[j], 2) for j in ARM}
+        if slot.startswith("payload."):          # payload poses live in their own file
+            name = slot.split(".", 1)[1]
+            self.ppl["poses"][name] = pose
+            self.ppl["taught"][name] = time.strftime("%Y-%m-%d %H:%M:%S")
+            save_payload(self.ppl)
+            self.poses_version += 1
+            return
         if slot == "home":
             self.poses["home"] = pose
             self.poses["home_taught"] = True
@@ -461,6 +567,8 @@ class Controller:
         """Lock held by caller."""
         if slot == "home":
             return self.poses["home"]
+        if slot.startswith("payload."):
+            return self.payload_pose(slot.split(".", 1)[1])
         n, kind = slot.split(".")
         return (self.poses["cells"].get(n) or {}).get(kind)
 
@@ -575,7 +683,7 @@ class Controller:
             return 409, "Stop recording first."
         if self.teach is not None and (self.teach["free"] or not allow_teach):
             return 409, ("Lock the arm first." if self.teach["free"] else "Leave teach mode first.")
-        self.program = {"name": name, "steps": steps, "i": 0, "move": None}
+        self.program = {"name": name, "steps": steps, "i": 0, "move": None, "t0": time.monotonic()}
         self.program_msg = ""
         return 200, f"{name}: {len(steps)} steps"
 
@@ -619,6 +727,299 @@ class Controller:
                      self._arm(c["grab"], f"lower to grab height in cell {n}"),
                      self._arm(c["hover"], f"back over cell {n}")]
             return self._start_program(f"Test cell {n}", steps, allow_teach=True)
+
+    # ---- payload experiment ------------------------------------------------------------
+    def payload_pose(self, name):
+        """Lock held by caller. The pose the test really uses. left/right = the lift pose with only
+        shoulder_pan taken from the taught pose, so in the dance only the base motor moves."""
+        poses = self.ppl["poses"]
+        if name in ("left", "right"):
+            lift, turn = poses.get("lift"), poses.get(name)
+            if not lift or not turn:
+                return None
+            return {**lift, "shoulder_pan": turn["shoulder_pan"]}
+        return poses.get(name)
+
+    def _payload_missing(self):
+        """Lock held by caller. What must be taught/set before a test can run."""
+        miss = [f"payload.{s}" for s in PAYLOAD_SLOTS if s not in self.ppl["poses"]]
+        if not self.ppl["gripper"]:
+            miss.append("payload gripper open/grip values")
+        return miss
+
+    def _payload_kg(self, mass_g):
+        return ((self.ppl["container_g"] or 0.0) + float(mass_g)) / 1000.0
+
+    def payload_info(self):
+        with self.lock:
+            taught, notes = self.ppl["poses"], []
+            for name in ("left", "right"):
+                t, lift = taught.get(name), taught.get("lift")
+                if t and lift:
+                    off = max(abs(t[j] - lift[j]) for j in ARM if j != "shoulder_pan")
+                    if off > 2.0:
+                        notes.append(f"{name.capitalize()} rotate differs from Lift by up to {off:.0f} deg in "
+                                     "joints other than the base. Only its base angle is used.")
+            return {"poses": {k: dict(v) for k, v in taught.items()},
+                    "effective": {s: self.payload_pose(s) for s in PAYLOAD_SLOTS},
+                    "gripper": self.ppl["gripper"], "container_g": self.ppl["container_g"],
+                    "taught": dict(self.ppl["taught"]), "missing": self._payload_missing(), "notes": notes,
+                    "masses_g": list(PAYLOAD_MASSES_G), "speeds": list(PAYLOAD_SPEEDS),
+                    "hold_s": HOLD_S, "hold_tol": HOLD_TOL, "load_warn": LOAD_WARN, "load_high": LOAD_HIGH,
+                    "stall_kgcm": self.model.stall if self.model else None}
+
+    def set_payload_gripper(self, body):
+        """Payload gripper open/grip (separate from the sorting values). Returns (code, msg)."""
+        try:
+            vals = {k: min(max(float(body[k]), 0.0), 100.0) for k in ("open", "grip")}
+        except (KeyError, TypeError, ValueError):
+            return 400, "Give both open and grip, as numbers 0 to 100."
+        with self.lock:
+            self.ppl["gripper"] = vals
+            save_payload(self.ppl)
+            self.poses_version += 1
+        return 200, f"Payload gripper saved: open {vals['open']:.1f} %, grip {vals['grip']:.1f} %."
+
+    def set_container(self, grams):
+        try:
+            g = float(grams)
+            assert 0 <= g <= 2000
+        except (TypeError, ValueError, AssertionError):
+            return 400, "Container mass must be a number of grams, 0 to 2000."
+        with self.lock:
+            self.ppl["container_g"] = g
+            save_payload(self.ppl)
+            self.poses_version += 1
+        return 200, f"Container mass saved: {g:g} g."
+
+    def teach_hold(self, value):
+        """Teach mode: hold the gripper at this % (to try payload open/grip values). Returns (code, msg)."""
+        try:
+            v = min(max(float(value), 0.0), 100.0)
+        except (TypeError, ValueError):
+            return 400, "value must be a number 0 to 100"
+        with self.lock:
+            if self.teach is None:
+                return 409, "Turn teach mode on first."
+            if self.program is not None:
+                return 409, "Wait for the motion to finish (or press STOP)."
+            self.target["gripper"] = v
+            self.teach_msg = f"Gripper held at {v:.1f} %."
+            return 200, self.teach_msg
+
+    def test_payload_path(self):
+        """Teach page: hover -> grab -> hover -> lift -> left -> right -> lift -> hover, gripper
+        untouched, at the current speed. For checking the taught payload poses."""
+        with self.lock:
+            missing = [f"payload.{s}" for s in PAYLOAD_SLOTS if s not in self.ppl["poses"]]
+            if missing:
+                return 409, "Teach these poses first: " + ", ".join(missing)
+            e = {s: self.payload_pose(s) for s in PAYLOAD_SLOTS}
+            steps = [self._arm(e[s], label) for s, label in (
+                ("hover", "hover"), ("grab", "grab"), ("hover", "hover"), ("lift", "lift"),
+                ("left", "left rotate (base only)"), ("right", "right rotate (base only)"),
+                ("lift", "lift"), ("hover", "hover"))]
+            return self._start_program("Test payload path", steps, allow_teach=True)
+
+    def _payload_path(self, carried_only):
+        """Lock held by caller. The arm poses of the test in order (carried part only, or all)."""
+        e = {s: self.payload_pose(s) for s in PAYLOAD_SLOTS}
+        carried = [e["grab"], e["hover"], e["lift"], e["left"], e["right"], e["lift"], e["hover"], e["grab"]]
+        return carried if carried_only else [self.poses["home"], e["hover"]] + carried + [e["hover"], self.poses["home"]]
+
+    def payload_precheck(self, mass_g):
+        """Predicted peak load per motor over the carried part of the test. Returns (code, body)."""
+        try:
+            mass_g = float(mass_g)
+        except (TypeError, ValueError):
+            return 400, {"msg": "mass_g must be a number"}
+        with self.lock:
+            missing = self._payload_missing()
+            if missing:
+                return 409, {"msg": "Teach or set these first: " + ", ".join(missing)}
+            if self.model is None:
+                return 200, {"msg": "No prediction (gravity model unavailable).", "precheck": None}
+            path = self._payload_path(carried_only=True)
+            kg, container = self._payload_kg(mass_g), self.ppl["container_g"]
+        peak, where = self.model.path_peak(path, kg)
+        worst = max(peak, key=peak.get)
+        level = "over" if peak[worst] > 100 else "high" if peak[worst] >= LOAD_HIGH else \
+                "warn" if peak[worst] >= LOAD_WARN else "ok"
+        names = ["grab", "hover", "lift", "left rotate", "right rotate", "lift", "hover", "grab"]
+        text = (f"{mass_g:g} g + container {container or 0:g} g: predicted peak {peak[worst]:.0f} % of stall on "
+                f"{worst.replace('_', ' ')} (near {names[where[worst]]}).")
+        if level == "over":
+            text += " Above 100 %: that motor is predicted NOT to hold it."
+        elif level == "high":
+            text += " Close to the limit."
+        if container is None:
+            text += " Container mass not set: counted as 0 g."
+        pc = {"mass_g": mass_g, "total_g": kg * 1000, "peak": peak, "worst": worst, "level": level, "text": text}
+        with self.lock:
+            self.payload["precheck"] = pc
+        return 200, {"msg": text, "precheck": pc}
+
+    def run_payload(self, mass_g, speed, confirm=False):
+        """Start the payload test. Returns (code, body)."""
+        try:
+            mass_g, speed = float(mass_g), float(speed)
+        except (TypeError, ValueError):
+            return 400, {"msg": "mass_g and speed must be numbers"}
+        if mass_g not in PAYLOAD_MASSES_G or speed not in PAYLOAD_SPEEDS:
+            return 400, {"msg": f"Payload must be one of {PAYLOAD_MASSES_G} g and speed one of {PAYLOAD_SPEEDS} deg/s."}
+        code, pre = self.payload_precheck(mass_g)
+        if code != 200:
+            return code, pre
+        pc = pre.get("precheck")
+        if pc and pc["level"] == "over" and not confirm:
+            return 409, {"msg": pc["text"] + " Press Run again to confirm.", "precheck": pc, "confirm": True}
+        with self.lock:
+            e = {s: self.payload_pose(s) for s in PAYLOAD_SLOTS}
+            g, home = self.ppl["gripper"], self.poses["home"]
+            steps = [
+                self._arm(home, "Home"),
+                self._grip(g["open"], f"open gripper ({g['open']:.1f} %)"),
+                self._arm(e["hover"], "hover over the container"),
+                self._arm(e["grab"], "lower to the container"),
+                self._grip(g["grip"], f"grip the container ({g['grip']:.1f} %)"),
+                self._event("payload_pick", "picked up"),
+                self._arm(e["hover"], "lift back to hover"),
+                self._arm(e["lift"], "move to the holding position"),
+                {"do": "hold", "s": HOLD_S, "pose": dict(e["lift"]), "label": f"HOLD {HOLD_S:g} s"},
+                {**self._arm(e["left"], "dance: rotate left (base only)"), "dance": True},
+                {**self._arm(e["right"], "dance: rotate right (base only)"), "dance": True},
+                {**self._arm(e["lift"], "dance: back to the holding position"), "dance": True},
+                self._arm(e["hover"], "back to hover"),
+                self._arm(e["grab"], "lower the container into cell 2"),
+                self._grip(g["open"], f"release ({g['open']:.1f} %)"),
+                self._event("payload_place", "put back"),
+                self._arm(e["hover"], "lift away"),
+                self._arm(home, "return to Home"),
+            ]
+            code, msg = self._start_program("Payload test", steps)
+            if code != 200:
+                return code, {"msg": msg}
+            p = self.program
+            p.update(payload=True, restore_speed=self.speed, mass_g=mass_g, run_speed=speed)
+            self.speed = speed
+            self.payload = {"status": "running", "msg": "", "mass_g": mass_g, "speed": speed,
+                            "total_g": self._payload_kg(mass_g) * 1000, "hold": None, "precheck": pc,
+                            "file": "", "result": None, "phase": "move"}
+            self._tel_peaks = {"all": {}, "hold_sum": {}, "hold_n": 0, "dance": {}, "current": {}, "pred": {},
+                               "temp": {}, "flags": set()}
+            self._payload_open_log(mass_g, speed)
+        return 200, {"msg": f"Payload test: {mass_g:g} g at {speed:g} deg/s.", "precheck": pc}
+
+    def payload_release(self):
+        """SAFETY CUTOFF: stop everything, freeze the arm where it is, open the gripper at once."""
+        with self.lock:
+            p = self.program
+            label = p["steps"][min(p["i"], len(p["steps"]) - 1)]["label"] if p else ""
+            self.replay = None
+            self.program = None
+            self.target = dict(self.cmd)                 # arm: stay exactly where it is
+            g = (self.ppl["gripper"] or {}).get("open")
+            if g is None:                                # payload values not set: use the sorting open value
+                g = self.poses["gripper"]["open"]
+            self.cmd["gripper"] = self.target["gripper"] = g   # no speed ramp: the jaw opens at once
+            self.payload_held = False
+            msg = f"RELEASED{' during: ' + label if label else ''}. Gripper opened to {g:.1f} %, arm frozen."
+            self.program_msg = msg
+            if p is not None and p.get("payload"):     # only a running payload test gets a RELEASED result
+                self._payload_end(p, "RELEASED", msg)
+        print(f"[payload] {msg}")
+        return 200, msg
+
+    def _payload_end(self, p, result, msg):
+        """Lock held by caller. Close a payload run: restore the speed, write the summary."""
+        if "restore_speed" in p:
+            self.speed = p["restore_speed"]
+        if result != "STOPPED":              # after STOP the container may still be in the gripper
+            self.payload_held = False
+        pl = self.payload
+        pl.update(status=result.lower(), result=result, msg=msg, phase="")
+        self._payload_close_log(p, result)
+
+    def _payload_open_log(self, mass_g, speed):
+        """Lock held by caller. Per-run CSV, one row per control tick."""
+        try:
+            os.makedirs(PAYLOAD_DIR, exist_ok=True)
+            name = time.strftime("%Y%m%d_%H%M%S") + f"_{mass_g:g}g_{speed:g}dps.csv"
+            f = open(os.path.join(PAYLOAD_DIR, name), "w", buffering=1 << 16)
+            cols = ["t", "step", "phase", "held"]
+            for j in JOINTS:
+                cols += [f"{j}_target", f"{j}_actual", f"{j}_load_pct", f"{j}_current_ma", f"{j}_temp_c", f"{j}_status"]
+            cols += [f"{j}_pred_pct" for j in ARM]
+            f.write(",".join(cols) + "\n")
+            self.payload_log = {"f": f, "t0": time.monotonic(), "name": name}
+            self.payload["file"] = "payload_runs/" + name
+        except OSError as e:
+            self.payload_log = None
+            self.payload["msg"] = f"Could not open the log file: {e}"
+
+    def _payload_log_row(self, pred):
+        """Lock held by caller (control loop). One CSV row."""
+        L, p = self.payload_log, self.program
+        if L is None or p is None:
+            return
+        tel = self.tel
+        row = [f"{time.monotonic() - L['t0']:.3f}", str(p["i"] + 1), self.payload.get("phase", ""),
+               "1" if self.payload_held else "0"]
+        for j in JOINTS:
+            row += [f"{self.target[j]:.2f}", f"{self.actual[j]:.2f}",
+                    _fmt(tel["load"].get(j)), _fmt(tel["current"].get(j), 0), _fmt(tel["temp"].get(j), 0),
+                    str(tel["status"].get(j, ""))]
+        row += [_fmt((pred or {}).get(j)) for j in ARM]
+        try:
+            L["f"].write(",".join(row) + "\n")
+        except (OSError, ValueError):
+            pass
+
+    def _payload_close_log(self, p, result):
+        """Lock held by caller. Close the CSV and add one line to payload_runs/summary.csv."""
+        L, self.payload_log = self.payload_log, None
+        pk = getattr(self, "_tel_peaks", None) or {}
+        hold = self.payload.get("hold") or {}
+        n = pk.get("hold_n") or 0
+        row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "payload_g": f"{p.get('mass_g', 0):g}",
+               "container_g": f"{self.ppl['container_g'] or 0:g}", "total_g": f"{self.payload.get('total_g', 0):g}",
+               "speed_dps": f"{p.get('run_speed', 0):g}", "result": result,
+               "hold_result": hold.get("result") or ("partial" if hold else ""), "hold_max_err_deg": _fmt(hold.get("max_err")),
+               "hold_worst_joint": hold.get("joint", ""), "slip": "1" if hold.get("slip") else "0",
+               "servo_flags": " ".join(sorted(pk.get("flags", set()))),
+               "duration_s": f"{time.monotonic() - p['t0']:.1f}"}
+        for j in ARM:
+            row[f"peak_load_{j}"] = _fmt(pk.get("all", {}).get(j))
+            row[f"hold_mean_load_{j}"] = _fmt(pk["hold_sum"][j] / n) if n and j in pk.get("hold_sum", {}) else ""
+            row[f"pred_hold_{j}"] = _fmt((hold.get("pred") or {}).get(j))
+            row[f"peak_pred_{j}"] = _fmt(pk.get("pred", {}).get(j))
+            row[f"peak_current_ma_{j}"] = _fmt(pk.get("current", {}).get(j), 0)
+        row["dance_peak_load_shoulder_pan"] = _fmt(pk.get("dance", {}).get("shoulder_pan"))
+        row["max_temp_c"] = _fmt(max(pk.get("temp", {}).values(), default=None), 0)
+        row["file"] = "payload_runs/" + L["name"] if L else ""
+        self.payload["summary"] = row
+        if L:
+            try:
+                L["f"].close()
+            except OSError:
+                pass
+        line = ",".join(str(v) for v in row.values())
+        header = ",".join(row.keys())
+
+        def job():
+            try:
+                os.makedirs(PAYLOAD_DIR, exist_ok=True)
+                path = os.path.join(PAYLOAD_DIR, "summary.csv")
+                new = not os.path.exists(path)
+                with open(path, "a") as f:
+                    if new:
+                        f.write(header + "\n")
+                    f.write(line + "\n")
+            except OSError as e:
+                print(f"[payload] could not write summary.csv: {e}")
+        threading.Thread(target=job, daemon=True).start()
+        print(f"[payload] {result}: {row['payload_g']} g at {row['speed_dps']} deg/s, hold {row['hold_result']} "
+              f"(max err {row['hold_max_err_deg']} deg on {row['hold_worst_joint']})")
 
     def scan_image(self, data, ctype, source):
         """Photo -> detector -> board. Valid only with 3 green + 2 + 1 blocks. Returns (code, body)."""
@@ -665,8 +1066,8 @@ class Controller:
             try:
                 self.set_board(scan["cells"])
                 plan = self.make_plan()
-                scan["msg"] = (f"Found {found}. " + (plan["summary"]["short"] + " Press Run."
-                                                     if plan["moves"] else "Already sorted."))
+                scan["found"] = found
+                scan["msg"] = self._scan_msg(found, plan)
             except (ValueError, sorting.PlanError) as e:
                 scan["ok"], scan["msg"] = False, str(e)
         with self.lock:
@@ -711,17 +1112,57 @@ class Controller:
             self.sort = None
         return clean
 
-    def make_plan(self, algorithm=SORT_ALGORITHM):
+    def make_plan(self, algorithm=None):
+        """Plan the board with the chosen planner. Passing `algorithm` also makes it the choice."""
+        if algorithm is not None and algorithm not in DEMO_ALGORITHMS:
+            raise sorting.PlanError(f"Unknown planner {algorithm!r}. Use one of: {', '.join(DEMO_ALGORITHMS)}.")
         with self.lock:
-            board = dict(self.board)
-        p = sorting.plan(board, algorithm)        # raises sorting.PlanError with a readable message
+            if self.program is not None:       # never replace the plan the robot is working through
+                raise sorting.PlanError("Wait for the robot to finish (or press STOP) before planning.")
+            if algorithm is not None:
+                self.sort_alg = algorithm
+            board, alg = dict(self.board), self.sort_alg
+            tm = sorting.TimeModel(self.poses, self.speed, GRIP_DWELL)   # robot time, for Dijkstra
+        try:
+            p = sorting.plan(board, alg, time_model=tm)   # raises sorting.PlanError with a readable message
+        except sorting.PlanError:
+            with self.lock:
+                self.sort = None               # no plan from another planner left on screen
+            raise
         p["current"] = None
         p["done"] = 0
+        p["speed"] = tm.speed                  # the speed cap the time was worked out for
         with self.lock:
             self.sort = p
         return p
 
-    def run_sort(self, algorithm=SORT_ALGORITHM):
+    def _scan_msg(self, found, plan):
+        return f"Found {found}. " + (plan["summary"]["short"] + " Press Run." if plan["moves"] else "Already sorted.")
+
+    def set_algorithm(self, name):
+        """Choose the planner from the menus. Re-plans the board right away. Returns (code, body)."""
+        if name not in DEMO_ALGORITHMS:
+            return 400, {"msg": f"Unknown planner {name!r}. Use one of: {', '.join(DEMO_ALGORITHMS)}."}
+        with self.lock:
+            if self.program is not None:
+                return 409, {"msg": "Wait for the robot to finish (or press STOP) first."}
+            self.sort_alg = name
+            has_blocks = any(self.board.values())
+            if not has_blocks:
+                self.sort = None
+        label = DEMO_ALGORITHMS[name]
+        if not has_blocks:
+            return 200, {"msg": f"Planner: {label}.", "plan": None}
+        try:
+            p = self.make_plan()
+        except sorting.PlanError as e:
+            return 200, {"msg": f"Planner: {label}. {e}", "plan": None}
+        with self.lock:                          # a scan's message quotes the plan: keep it true
+            if self.scan and self.scan.get("ok") and self.scan.get("found"):
+                self.scan["msg"] = self._scan_msg(self.scan["found"], p)
+        return 200, {"msg": f"Planner: {label}. {p['summary']['short']}", "plan": p}
+
+    def run_sort(self, algorithm=None):
         p = self.make_plan(algorithm)
         if not p["moves"]:
             return 200, "Already sorted: nothing to do.", p
@@ -733,9 +1174,25 @@ class Controller:
         p = self.program
         while p["i"] < len(p["steps"]):
             st = p["steps"][p["i"]]
+            if st.get("dance") and p.get("skip_dance"):   # the hold failed: no dance, put it back
+                p["i"] += 1
+                continue
+            if p.get("payload") and "_phase" not in st:   # what the arm is doing, for the logs
+                st["_phase"] = ("hold" if st["do"] == "hold" else "dance" if st.get("dance")
+                                else "carry" if self.payload_held else "move")
+                self.payload["phase"] = st["_phase"]
+            if st["do"] == "hold":
+                if self._hold_tick(p, st, dt):
+                    return
+                p["i"] += 1
+                continue
             if st["do"] == "event":           # instant: update the board, then go on
                 ev = st["event"]
-                if ev == "move":
+                if ev == "payload_pick":
+                    self.payload_held = True
+                elif ev == "payload_place":
+                    self.payload_held = False
+                elif ev == "move":
                     p["move"] = st["n"] or None
                     if self.sort is not None and st["n"]:
                         self.sort["current"] = st["n"]
@@ -782,12 +1239,174 @@ class Controller:
                     return
             p["i"] += 1
         worst = p.get("worst", 0.0)
-        self.program_msg = f"{p['name']} finished." + (
+        took = ""
+        if p["name"] == "Sort" and self.sort is not None:   # real time vs the planner's prediction
+            elapsed = time.monotonic() - p["t0"]
+            pred = self.sort["summary"].get("seconds")
+            self.sort["measured_s"] = round(elapsed, 1)
+            took = f" Took {elapsed:.1f} s" + (f" (predicted {pred:.1f} s)." if pred else ".")
+            self._log_sort(elapsed, worst)
+        self.program_msg = f"{p['name']} finished.{took}" + (
             f" Largest pose error {worst:.1f} deg (carried on)." if worst > ARRIVE_TOL else "")
         self.program = None
+        if p.get("payload"):
+            h = self.payload.get("hold") or {}
+            result = h.get("result") or "FAIL"
+            msg = (f"{p['mass_g']:g} g at {p['run_speed']:g} deg/s: HOLD {result}"
+                   + (f" ({h['reason']})." if h.get("reason") else ".")
+                   + (" Dance skipped, container put back." if p.get("skip_dance") else " Dance done, container put back."))
+            self.program_msg = "Payload test finished. " + msg
+            self._payload_end(p, result, msg)
         if p["name"] == "Sort" and self.scan and self.scan.get("files"):   # demo done: delete its photo
             self._forget_scan(self.scan)
             self.scan["msg"] = "Sorted. The photo has been deleted." if not self.keep_scans else "Sorted."
+
+    def _hold_tick(self, p, st, dt):
+        """Lock held (control loop). The 5 s holding test. True = still holding, False = done.
+        PASS: every arm joint stays within HOLD_TOL of the lift pose, no arm servo flags
+        overload/overcurrent, and the container does not slip (gripper closing further)."""
+        if "_t" not in st:
+            st.update(_t=0.0, _err={}, _g0=self.actual["gripper"], _flags=set())
+            kg = self._payload_kg(p["mass_g"])
+            st["_pred"] = self.model.percent(st["pose"], kg) if self.model else None
+        st["_t"] += dt
+        for j in ARM:
+            st["_err"][j] = max(st["_err"].get(j, 0.0), abs(self.actual[j] - st["pose"][j]))
+            for name in _flags(self.tel["status"].get(j)):
+                if name in ("overload", "overcurrent"):
+                    st["_flags"].add(f"{j} {name}")
+        grip = (self.ppl["gripper"] or {}).get("grip", 0.0)
+        slip = st["_g0"] > grip + 1.0 and st["_g0"] - self.actual["gripper"] > SLIP_PCT
+        joint = max(st["_err"], key=st["_err"].get)
+        h = {"t": min(st["_t"], st["s"]), "s": st["s"], "max_err": st["_err"][joint], "joint": joint,
+             "errors": dict(st["_err"]), "slip": slip, "flags": sorted(st["_flags"]), "tol": HOLD_TOL,
+             "pred": st["_pred"], "result": None, "reason": ""}
+        if st["_t"] < st["s"] and not slip:     # a slip ends the hold at once
+            self.payload["hold"] = h
+            return True
+        reasons = []
+        if h["max_err"] > HOLD_TOL:
+            reasons.append(f"{joint.replace('_', ' ')} moved {h['max_err']:.1f} deg (limit {HOLD_TOL:g})")
+        if slip:
+            reasons.append("the container slipped in the gripper")
+        if st["_flags"]:
+            reasons.append("servo flag: " + ", ".join(sorted(st["_flags"])))
+        h["result"] = "FAIL" if reasons else "PASS"
+        h["reason"] = "; ".join(reasons) if reasons else \
+            f"largest error {h['max_err']:.1f} deg on {joint.replace('_', ' ')}"
+        self.payload["hold"] = h
+        if reasons:
+            p["skip_dance"] = True
+        return False
+
+    def _payload_track(self):
+        """Lock held (control loop), payload test running: prediction, peaks, one log row."""
+        p = self.program
+        kg = self._payload_kg(p["mass_g"]) if self.payload_held else 0.0
+        pred = self.model.percent(self.actual, kg) if self.model else None
+        pk, tel, phase = self._tel_peaks, self.tel, self.payload.get("phase")
+        for j in JOINTS:
+            ld = tel["load"].get(j)
+            if ld is not None:
+                pk["all"][j] = max(pk["all"].get(j, 0.0), ld)
+                if phase == "dance":
+                    pk["dance"][j] = max(pk["dance"].get(j, 0.0), ld)
+                if phase == "hold" and j in ARM:
+                    pk["hold_sum"][j] = pk["hold_sum"].get(j, 0.0) + ld
+            if tel["current"].get(j) is not None:
+                pk["current"][j] = max(pk["current"].get(j, 0.0), tel["current"][j])
+            if tel["temp"].get(j) is not None:
+                pk["temp"][j] = max(pk["temp"].get(j, 0.0), tel["temp"][j])
+            for name in _flags(tel["status"].get(j)):
+                pk["flags"].add(f"{j}:{name}")
+        if phase == "hold":
+            pk["hold_n"] += 1
+        for j, v in (pred or {}).items():
+            pk["pred"][j] = max(pk["pred"].get(j, 0.0), v)
+        self._payload_log_row(pred)
+
+    # ---- servo telemetry (real robot) ------------------------------------------------
+    def _read_telemetry(self):
+        """Loop thread only. ONE register from all motors per tick, so each tick stays short:
+        load and current 10 times a second, status 5, temperature and voltage 2.5 each."""
+        reg = TELEMETRY_CYCLE[self._tel_i % len(TELEMETRY_CYCLE)]
+        self._tel_i += 1
+        if reg == "slow":
+            reg = TELEMETRY_SLOW[self._tel_slow % len(TELEMETRY_SLOW)]
+            self._tel_slow += 1
+        try:
+            return reg, self.robot.bus.sync_read(reg, list(JOINTS), normalize=False), ""
+        except Exception as e:                 # a missed read must never stop the control loop
+            return reg, None, str(e)
+
+    def _apply_telemetry(self, reg, vals, err):
+        """Lock held. Raw register values -> units."""
+        t = self.tel
+        if vals is None:
+            t["fails"] += 1
+            t["err"] = f"{reg}: {err}"
+            if t["fails"] >= TELEMETRY_MAX_FAILS:
+                self.telemetry_on = False
+                t["err"] = f"Servo readings switched off after {t['fails']} failed reads in a row ({err})."
+                print(f"[telemetry] {t['err']}")
+            return
+        t["fails"], t["err"] = 0, ""
+        for j, v in vals.items():
+            v = int(v)
+            if reg == "Present_Load":            # 0.1 % units, sign = direction (decoded by LeRobot)
+                t["load"][j] = abs(v) / 10.0
+            elif reg == "Present_Current":       # 6.5 mA units
+                t["current"][j] = (v & 0x7FFF) * 6.5
+            elif reg == "Status":
+                t["status"][j] = v
+            elif reg == "Present_Temperature":   # deg C
+                t["temp"][j] = float(v)
+            elif reg == "Present_Voltage":       # 0.1 V units
+                t["volt"][j] = v / 10.0
+        t["t"] = time.monotonic()
+
+    def _load_view(self):
+        """Lock held. What the pages colour the motors with: real readings, or the model."""
+        kg = 0.0
+        if self.payload_held and self.payload.get("mass_g") is not None:
+            kg = self._payload_kg(self.payload["mass_g"])
+        pred = self.model.percent(self.actual, kg) if self.model else None
+        t = self.tel
+        real = self.telemetry_on and t["t"] > 0
+        return {
+            "source": "real" if real else "model",
+            "pred": pred, "payload_kg": kg,
+            "load": dict(t["load"]) if real else None,
+            "current": dict(t["current"]) if real else None,
+            "temp": dict(t["temp"]) if real else None,
+            "volt": dict(t["volt"]) if real else None,
+            "flags": {j: _flags(v) for j, v in t["status"].items() if _flags(v)} if real else {},
+            "age": round(time.monotonic() - t["t"], 2) if real else None,
+            "err": t["err"],
+            "warn": LOAD_WARN, "high": LOAD_HIGH,
+        }
+
+    def _log_sort(self, elapsed, worst):
+        """Lock held by caller. Append one line to sort_runs.csv (in the background: the control
+        loop never waits for the disk). Data for comparing the planners on the real robot."""
+        s = self.sort
+        board = "".join((s["start"].get(str(n)) or ".")[0].upper() for n in range(1, 10))
+        row = [time.strftime("%Y-%m-%d %H:%M:%S"), s["algorithm"], board, s["summary"]["length"],
+               s["summary"]["minimum"], s["summary"].get("seconds") or "", f"{elapsed:.1f}",
+               f"{s.get('speed', self.speed):g}", f"{worst:.1f}"]
+        def job():
+            try:
+                new = not os.path.exists(SORT_LOG)
+                with open(SORT_LOG, "a") as f:
+                    if new:
+                        f.write("time,algorithm,start_board,moves,min_moves,predicted_s,measured_s,"
+                                "speed_deg_s,worst_pose_err_deg\n")
+                    f.write(",".join(map(str, row)) + "\n")
+            except OSError as e:
+                print(f"[sort] could not write {SORT_LOG}: {e}")
+        threading.Thread(target=job, daemon=True).start()
+        print(f"[sort] {s['algorithm']} {board}: {s['summary']['length']} moves, "
+              f"predicted {s['summary'].get('seconds')} s, measured {elapsed:.1f} s")
 
     def _program_status(self):
         p = self.program
@@ -909,8 +1528,12 @@ class Controller:
                 "board": dict(self.board),
                 "holding": self.holding,
                 "sort": self.sort,
+                "sort_algorithm": self.sort_alg,
                 "scan": self.scan,
                 "poses_version": self.poses_version,
+                "payload": self.payload,
+                "payload_held": self.payload_held,
+                "loads": self._load_view(),
             }
 
     def config(self):
@@ -921,13 +1544,17 @@ class Controller:
             "speed_ceiling": SPEED_CEILING,
             "loop_hz": LOOP_HZ,
             "twin_calib": load_twin_calib(),
-            "algorithms": sorting.ALGORITHMS,
+            "algorithms": DEMO_ALGORITHMS,     # planners the menus offer: {id: short label}
             "targets": {k: list(v) for k, v in sorting.DEFAULT_TARGETS.items()},
+            "sim": isinstance(self.robot, SimRobot),
+            "telemetry": self.telemetry_on,
         }
 
     def poses_info(self):
         with self.lock:
-            return {"version": self.poses_version, **self.poses}
+            info = {"version": self.poses_version, **self.poses}
+        info["payload"] = self.payload_info()        # takes the lock itself
+        return info
 
     # ---- control loop -----------------------------------------------------
     def _loop(self):
@@ -957,11 +1584,16 @@ class Controller:
                 self.robot.send_action({"gripper.pos": action["gripper.pos"]} if arm_free else action)
                 obs = self.robot.get_observation()
                 actual = {j: float(obs[f"{j}.pos"]) for j in JOINTS}
+                tel = self._read_telemetry() if self.telemetry_on else None
 
                 with self.lock:
                     self.actual = actual
                     self.actual_t = time.monotonic()
                     self.error = ""
+                    if tel is not None:
+                        self._apply_telemetry(*tel)
+                    if self.program is not None and self.program.get("payload"):
+                        self._payload_track()
                     if self.rec_file is not None:
                         entry = {"t": t0 - self.rec_t0, "action": action}
                         self.rec_file.write(json.dumps(entry) + "\n")
@@ -1030,6 +1662,8 @@ def make_handler(ctrl):
                 return self._json(200, {"files": list_motions()})
             if p == "/api/poses":
                 return self._json(200, ctrl.poses_info())
+            if p == "/api/payload":
+                return self._json(200, ctrl.payload_info())
             if p == "/teach":
                 return self._file(WEB_ROOT, "teach.html")
             if p.startswith("/urdf/"):
@@ -1057,8 +1691,28 @@ def make_handler(ctrl):
                     return self._json(409, {"msg": why})
                 return self._json(200, {"ok": True})
             if p == "/api/speed":
-                ctrl.set_speed(body.get("speed", DEFAULT_SPEED))
+                try:
+                    ok = ctrl.set_speed(body.get("speed", DEFAULT_SPEED))
+                except (TypeError, ValueError):
+                    return self._json(400, {"msg": "speed must be a number"})
+                if not ok:
+                    return self._json(409, {"msg": "A payload test is running: its speed is fixed until it ends."})
                 return self._json(200, {"ok": True})
+            # ---- payload experiment ---------------------------------------------
+            if p == "/api/payload/release":         # SAFETY CUTOFF, checked first
+                return self._json(*self._cm(ctrl.payload_release()))
+            if p == "/api/payload/run":
+                return self._json(*ctrl.run_payload(body.get("mass_g"), body.get("speed"), bool(body.get("confirm"))))
+            if p == "/api/payload/precheck":
+                return self._json(*ctrl.payload_precheck(body.get("mass_g")))
+            if p == "/api/payload/gripper":
+                return self._json(*self._cm(ctrl.set_payload_gripper(body)))
+            if p == "/api/payload/container":
+                return self._json(*self._cm(ctrl.set_container(body.get("container_g"))))
+            if p == "/api/payload/test_path":
+                return self._json(*self._cm(ctrl.test_payload_path()))
+            if p == "/api/teach/hold":
+                return self._json(*self._cm(ctrl.teach_hold(body.get("value"))))
             if p == "/api/stop":
                 ctrl.stop()
                 return self._json(200, {"msg": "Stopped (target = current command)"})
@@ -1121,8 +1775,10 @@ def make_handler(ctrl):
                     return self._json(200, {"board": board})
                 except (ValueError, TypeError, AttributeError) as e:
                     return self._json(400, {"msg": str(e)})
+            if p == "/api/sort/algorithm":
+                return self._json(*ctrl.set_algorithm(str(body.get("algorithm") or "")))
             if p in ("/api/sort/plan", "/api/sort/run"):
-                alg = str(body.get("algorithm") or SORT_ALGORITHM)
+                alg = str(body["algorithm"]) if body.get("algorithm") else None   # None: the chosen one
                 try:
                     if p == "/api/sort/plan":
                         plan = ctrl.make_plan(alg)
@@ -1143,6 +1799,8 @@ def make_handler(ctrl):
                     save_twin_calib(body)
                 except (OSError, ValueError, TypeError, AttributeError) as e:
                     return self._json(400, {"msg": str(e)})
+                if ctrl.model is not None:           # the prediction uses the same angle mapping
+                    ctrl.model.calib = load_twin_calib()
                 return self._json(200, {"msg": "saved"})
             self.send_error(404)
 
@@ -1163,6 +1821,8 @@ def main():
                     help="block detector service for Scan (detector/locate_service.py)")
     ap.add_argument("--keep-scans", action="store_true",
                     help="keep scan photos (default: delete a photo when its sort finishes or a new scan replaces it)")
+    ap.add_argument("--no-telemetry", action="store_true",
+                    help="do not read load/current/temperature from the servos (payload view then shows the model)")
     args = ap.parse_args()
 
     if args.sim:
@@ -1179,6 +1839,8 @@ def main():
         ctrl = Controller(robot, args.max_speed)
         ctrl.detector_url = args.detector.rstrip("/")
         ctrl.keep_scans = args.keep_scans
+        if args.no_telemetry:
+            ctrl.telemetry_on = False
     except Exception:
         robot.disconnect()
         raise

@@ -22,6 +22,19 @@ Algorithms the user can choose:
     bfs            breadth-first search: always the fewest moves
     astar          A* search guided by "misplaced + loops": fewest moves,
                    usually explores far fewer layouts than BFS
+    dijkstra       Dijkstra on robot TIME, not on move count: always the
+                   fastest plan for the real arm (needs a TimeModel)
+
+Why Dijkstra counts seconds: with every move costing 1, Dijkstra gives exactly
+the same answer as BFS. But moves do not cost the same on the robot: cell 1 to
+cell 9 takes longer than cell 4 to cell 7, and where the arm starts each move
+matters too. So the Dijkstra state is (board, where the arm is) and the cost of
+a move is the time the sequencer in twin_server.py needs for it, worked out from
+the taught poses and the speed cap (see TimeModel). Sometimes the fastest plan
+even uses one move more than the minimum.
+
+The demo menu offers greedy_simple, bfs and dijkstra. The others stay for the
+command line and the self test.
 
 Only the standard library is used.
 """
@@ -42,7 +55,9 @@ ALGORITHMS = {
     "greedy_smart": "Greedy (smart)",
     "bfs": "BFS (fewest moves)",
     "astar": "A* (fewest moves)",
+    "dijkstra": "Dijkstra (fastest)",
 }
+ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 
 
 class PlanError(ValueError):
@@ -234,6 +249,153 @@ def _optimal_moves(start, goal):
     return lower_bound(start, goal)      # exact, see selftest()
 
 
+# ---- robot time ------------------------------------------------------------------
+class TimeModel:
+    """Seconds the robot needs for a plan, worked out the way twin_server.py runs it.
+
+    poses: the taught poses (same layout as taught_poses.json: "home", "cells", "gripper").
+    speed: the speed cap in deg/s (the gripper moves in %/s at the same number).
+
+    - Every arm motion is one straight line in joint space at the speed cap, so it takes
+      (largest joint change) / speed.
+    - A gripper step takes (change) / speed, then the dwell (grip_dwell seconds).
+    - One block move: hover over src, lower, close, lift, hover over dst, lower, open, lift.
+    - A plan starts at Home (first it opens the gripper) and ends back at Home.
+
+    Not counted: the short wait after a motion while the servos catch up (up to 1 s, see
+    ARRIVE_WAIT in twin_server.py). So the real run takes a little longer than this.
+    Arm positions are numbers: 0 = at Home, n = hovering over cell n.
+    """
+
+    def __init__(self, poses, speed, grip_dwell=0.6):
+        self.speed = max(float(speed), 1e-3)
+        self.dwell = float(grip_dwell)
+        g = poses["gripper"]
+        self.g_open, self.g_grip, self.g_home = float(g["open"]), float(g["grip"]), float(g["home"])
+        self.home = {j: float(poses["home"][j]) for j in ARM_JOINTS}
+        self.cells = {}
+        for n in CELLS:
+            c = (poses.get("cells") or {}).get(str(n)) or {}
+            if c.get("hover") and c.get("grab"):
+                self.cells[n] = tuple({j: float(c[k][j]) for j in ARM_JOINTS} for k in ("hover", "grab"))
+        self._cache = {}
+
+    def missing(self, cells=CELLS):
+        return [n for n in sorted(set(cells)) if n not in self.cells]
+
+    def require(self, cells=CELLS):
+        m = self.missing(cells)
+        if m:
+            raise PlanError("Dijkstra needs the hover and grab poses of every cell. "
+                            f"Teach cell{'s' if len(m) > 1 else ''} {', '.join(map(str, m))} first.")
+
+    def _arm(self, a, b):
+        return max(abs(a[j] - b[j]) for j in ARM_JOINTS) / self.speed
+
+    def _grip(self, a, b):
+        return abs(a - b) / self.speed + self.dwell
+
+    def _at(self, arm):
+        return self.home if arm == 0 else self.cells[arm][0]
+
+    def move(self, arm, src, dst):
+        """Seconds for one block move from src to dst, with the arm starting at `arm`."""
+        key = (arm, src, dst)
+        t = self._cache.get(key)
+        if t is None:
+            (hs, gs), (hd, gd) = self.cells[src], self.cells[dst]
+            t = (self._arm(self._at(arm), hs) + 2 * self._arm(hs, gs) + self._grip(self.g_open, self.g_grip)
+                 + self._arm(hs, hd) + 2 * self._arm(hd, gd) + self._grip(self.g_grip, self.g_open))
+            self._cache[key] = t
+        return t
+
+    def start(self):
+        """Opening the gripper at Home, before the first move."""
+        return self._grip(self.g_home, self.g_open)
+
+    def finish(self, arm):
+        """Back to Home from `arm`, then the gripper to its Home value."""
+        return self._arm(self._at(arm), self.home) + self._grip(self.g_open, self.g_home)
+
+    def plan_seconds(self, moves):
+        if not moves:
+            return 0.0
+        t, arm = self.start(), 0
+        for src, dst in moves:
+            t += self.move(arm, src, dst)
+            arm = dst
+        return t + self.finish(arm)
+
+
+def _dijkstra(start, goal, tm):
+    """Fewest robot seconds. A node is (board, arm position). Returns (moves, nodes explored)."""
+    target = goal_state(goal)
+    if start == target:
+        return [], 1
+    tm.require()
+    end = ("end",)                       # one extra node: "sorted and back at Home"
+    tie = itertools.count()
+    s0 = (start, 0)
+    best, parent = {s0: tm.start()}, {s0: None}
+    heap = [(best[s0], next(tie), s0)]
+    closed, explored = set(), 0
+    while heap:
+        d, _, node = heapq.heappop(heap)
+        if node in closed:
+            continue
+        closed.add(node)
+        explored += 1
+        if node == end:
+            break
+        board, arm = node
+        if board == target:              # sorted: only the trip back Home is left
+            nd = d + tm.finish(arm)
+            if nd < best.get(end, float("inf")):
+                best[end], parent[end] = nd, (node, None)
+                heapq.heappush(heap, (nd, next(tie), end))
+            continue
+        for (src, dst), nb in neighbours(board):
+            nxt, nd = (nb, dst), d + tm.move(arm, src, dst)
+            if nd < best.get(nxt, float("inf")):
+                best[nxt], parent[nxt] = nd, (node, (src, dst))
+                heapq.heappush(heap, (nd, next(tie), nxt))
+    moves, node = [], end
+    while parent[node] is not None:
+        node, m = parent[node]
+        if m:
+            moves.append(m)
+    return moves[::-1], explored
+
+
+def _time_table(tm, goal):
+    """For the self test: the fewest seconds from EVERY (board, arm) node, by one Dijkstra run
+    backwards from the goal. Independent of _dijkstra(), so it can check it."""
+    target = goal_state(goal)
+    tie = itertools.count()
+    heap = [(tm.finish(a), next(tie), (target, a)) for a in [0] + [n for n in CELLS if target[n - 1]]]
+    table = {}
+    while heap:
+        w, _, node = heapq.heappop(heap)
+        if node in table:
+            continue
+        table[node] = w
+        after, dst = node
+        if dst == 0:
+            continue
+        for src in CELLS:                # the move that led here was src -> dst
+            if after[src - 1]:
+                continue
+            b = list(after)
+            b[src - 1], b[dst - 1] = after[dst - 1], None
+            b = tuple(b)
+            for arm in [0] + list(CELLS):
+                if arm and b[arm - 1] is None:   # the arm hovers where it last put a block
+                    continue
+                if (b, arm) not in table:
+                    heapq.heappush(heap, (w + tm.move(arm, src, dst), next(tie), (b, arm)))
+    return table
+
+
 # ---- explanations ----------------------------------------------------------------
 def _explain(state, src, dst, goal):
     colour = state[src - 1]
@@ -253,8 +415,12 @@ def _explain(state, src, dst, goal):
     return "park", f"Park {colour} in cell {dst} for now."
 
 
-def plan(cells, algorithm="astar", targets=None, main=MAIN_COLOR):
-    """Main entry. cells: {"1": "blue", ...}. Returns a JSON-ready dict."""
+def plan(cells, algorithm="astar", targets=None, main=MAIN_COLOR, time_model=None):
+    """Main entry. cells: {"1": "blue", ...}. Returns a JSON-ready dict.
+
+    time_model: a TimeModel. Needed for "dijkstra". With it, every plan also gets
+    summary["seconds"], the predicted robot time (when its cells are taught).
+    """
     if algorithm not in ALGORITHMS:
         raise PlanError(f"unknown algorithm {algorithm}, use one of {', '.join(ALGORITHMS)}")
     start = normalise_board(cells)
@@ -266,8 +432,15 @@ def plan(cells, algorithm="astar", targets=None, main=MAIN_COLOR):
         moves, explored = _greedy(start, goal, smart=True)
     elif algorithm == "bfs":
         moves, explored = _bfs(start, goal)
+    elif algorithm == "dijkstra":
+        if time_model is None:
+            raise PlanError("Dijkstra needs the taught poses to work out robot time.")
+        moves, explored = _dijkstra(start, goal, time_model)
     else:
         moves, explored = _astar(start, goal)
+    seconds = None
+    if time_model is not None and not time_model.missing(c for m in moves for c in m):
+        seconds = round(time_model.plan_seconds(moves), 1)
 
     steps, s = [], start
     for k, (src, dst) in enumerate(moves, 1):
@@ -277,7 +450,13 @@ def plan(cells, algorithm="astar", targets=None, main=MAIN_COLOR):
     assert s == goal_state(goal)
 
     m, lp = misplaced(start, goal), loops(start, goal)
-    best = m + len(lp)
+    best, n = m + len(lp), len(steps)
+    if algorithm == "dijkstra":
+        quality = " (also the fewest moves)" if n == best else f" ({n - best} more than the minimum, but faster)"
+    else:
+        quality = " (optimal)" if n == best else f" ({n - best} more than needed)"
+    timing = f", {seconds:.1f} s robot time" if seconds else ""
+    explored_what = "States (board + arm position)" if algorithm == "dijkstra" else "Layouts"
     return {
         "algorithm": algorithm,
         "algorithm_name": ALGORITHMS[algorithm],
@@ -289,21 +468,28 @@ def plan(cells, algorithm="astar", targets=None, main=MAIN_COLOR):
             "misplaced": m,
             "loops": [sorted(c) for c in lp],
             "minimum": best,
-            "length": len(steps),
-            "optimal": len(steps) == best,
+            "length": n,
+            "optimal": n == best,             # fewest moves
+            "fastest": algorithm == "dijkstra",
+            "seconds": seconds,               # predicted robot time, None if unknown
             "explored": explored,
-            "short": f"Plan: {len(steps)} move{'s' if len(steps) != 1 else ''}.",
+            "short": (f"Plan: {n} move{'s' if n != 1 else ''}"
+                      + (f", about {seconds:.0f} s." if seconds else ".")),
             "text": (f"{m} misplaced + {len(lp)} loop{'s' if len(lp) != 1 else ''} = {best} moves minimum. "
-                     f"{ALGORITHMS[algorithm]} plan: {len(steps)} moves"
-                     f"{' (optimal)' if len(steps) == best else f' ({len(steps) - best} more than needed)'}. "
-                     f"Layouts explored: {explored}."),
+                     f"{ALGORITHMS[algorithm]} plan: {n} moves{quality}{timing}. "
+                     f"{explored_what} explored: {explored}."),
         },
     }
 
 
 # ---- self test -------------------------------------------------------------------
-def selftest():
-    """Check every claim in the docstring on all 5040 start layouts."""
+def selftest(tm=None, sample=300):
+    """Check every claim in the docstring on all 5040 start layouts.
+
+    With a TimeModel (taught poses + speed) it also checks Dijkstra: no other planner is ever
+    faster, and Dijkstra matches the exact fastest time (a separate backward search) on
+    `sample` random layouts (all 5040 take about 15 minutes).
+    """
     roles = {"A": "green", "B": "blue", "C": "red"}
     goal = goal_map(roles)
     target = goal_state(goal)
@@ -319,34 +505,104 @@ def selftest():
                 q.append(t)
     assert len(starts) == 5040
     extra = {"greedy_simple": Counter(), "greedy_smart": Counter()}
+    timed = ("greedy_simple", "bfs", "dijkstra")
+    secs = {a: [] for a in timed}
+    moves_n = {a: [] for a in timed}
+    table = _time_table(tm, goal) if tm else None
     for s in starts:
         assert dist[s] == lower_bound(s, goal), s
         cells = board_dict(s)
         for alg in ALGORITHMS:
-            p = plan(cells, alg)
+            if alg == "dijkstra":
+                continue
+            p = plan(cells, alg, time_model=tm)
             n = p["summary"]["length"]
             if alg in ("bfs", "astar"):
                 assert n == dist[s], (alg, s)
             else:
                 extra[alg][n - dist[s]] += 1
+            if tm and alg in secs:
+                t = tm.plan_seconds([(m["src"], m["dst"]) for m in p["moves"]])
+                assert t >= table[(s, 0)] + tm.start() - 1e-6 or not p["moves"], (alg, s)
+                secs[alg].append(t)
+                moves_n[alg].append(n)
+        if tm:                           # the exact fastest time, from the backward table
+            fastest = 0.0 if s == target else table[(s, 0)] + tm.start()
+            secs["dijkstra"].append(fastest)
     loops_n = sum(1 for s in starts if loops(s, goal))
     print("5040 layouts: fewest moves = misplaced + loops on every one")
     print("BFS and A* are optimal on every one")
     print("layouts with a loop:", loops_n)
     for alg, c in extra.items():
         print(f"{alg}: extra moves -> layouts {dict(sorted(c.items()))}")
+    if not tm:
+        print("(no taught poses given: Dijkstra not checked)")
+        return True
+
+    import random
+    rng = random.Random(0)
+    picks = starts if sample >= len(starts) else rng.sample(starts, sample)
+    index = {s: i for i, s in enumerate(starts)}
+    longest = 0
+    for s in picks:
+        p = plan(board_dict(s), "dijkstra", time_model=tm)
+        mv = [(m["src"], m["dst"]) for m in p["moves"]]
+        assert abs(tm.plan_seconds(mv) - secs["dijkstra"][index[s]]) < 1e-6, s
+        longest = max(longest, len(mv))
+        moves_n["dijkstra"].append(len(mv))
+    N = len(starts)
+    print(f"\nRobot time at {tm.speed:g} deg/s, gripper dwell {tm.dwell:g} s (Home to Home, no settle waits):")
+    print(f"Dijkstra matches the exact fastest time on {len(picks)} checked layouts "
+          f"(longest Dijkstra plan there: {longest} moves)")
+    print("no other planner is faster on any of the 5040 layouts")
+    for alg in timed:
+        ts = secs[alg]
+        mv = moves_n[alg]
+        print(f"  {ALGORITHMS[alg]:22s} mean {sum(ts) / N:5.1f} s   worst {max(ts):5.1f} s   "
+              f"mean moves {sum(mv) / len(mv):.2f}" + ("  (sampled)" if alg == "dijkstra" else ""))
+    for ref in ("greedy_simple", "bfs"):
+        gain = [a - b for a, b in zip(secs[ref], secs["dijkstra"])]
+        pct = [g / a * 100 for g, a in zip(gain, secs[ref]) if a > 0]
+        print(f"  Dijkstra vs {ALGORITHMS[ref]}: faster on {sum(1 for g in gain if g > 0.05)} layouts, "
+              f"mean {sum(gain) / N:.1f} s ({sum(pct) / len(pct):.1f} %), best {max(gain):.1f} s")
     return True
 
 
+def load_time_model(path=None, speed=30.0, grip_dwell=0.6):
+    """TimeModel from a taught_poses.json file (default: the one next to this file), or None."""
+    import json
+    import os
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "taught_poses.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return TimeModel(data, speed, grip_dwell)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 if __name__ == "__main__":
+    # python sorting.py                       example plans (the layout in the phone photo)
+    # python sorting.py test [poses.json]     self test; Dijkstra too if the poses file loads
+    # add --speed N to change the speed cap used for robot time (default 30 deg/s)
     import json
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        selftest()
-    else:      # example: the layout in the phone photo
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    speed = 30.0
+    if "--speed" in sys.argv:
+        speed = float(sys.argv[sys.argv.index("--speed") + 1])
+        args = [a for a in args if a != sys.argv[sys.argv.index("--speed") + 1]]
+    if args and args[0] == "test":
+        tm = load_time_model(args[1] if len(args) > 1 else None, speed)
+        selftest(tm)
+    else:
+        tm = load_time_model(None, speed)
         demo = {"1": "green", "3": "yellow", "4": "yellow", "5": "red", "7": "green", "9": "green"}
         for a in ALGORITHMS:
-            p = plan(demo, a)
+            if a == "dijkstra" and not tm:
+                print("Dijkstra skipped: no taught_poses.json next to sorting.py")
+                continue
+            p = plan(demo, a, time_model=tm)
             print(p["summary"]["text"])
             for m in p["moves"]:
                 print(f"  {m['n']}. {m['src']} -> {m['dst']}  {m['why']}")

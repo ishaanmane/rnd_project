@@ -99,6 +99,9 @@
       <div class="homeslot"><div class="slot" data-slot="home"><span>Home</span><span class="tick" id="tick-home"></span></div></div>
       <div class="cells" id="cells"></div>
       <div class="robotside">ROBOT SIDE</div>
+      <h2 style="margin-top:16px">Payload test <span style="text-transform:none;letter-spacing:0">(container in cell 2, own file: the sorting poses are not touched)</span></h2>
+      <div class="cells" id="pslots" style="grid-template-columns:repeat(5,1fr)"></div>
+      <div id="pnotes" style="color:var(--warn);font-size:12px;margin-top:6px"></div>
     </div>
 
     <div class="card">
@@ -115,6 +118,18 @@
         <label for="g-home">At Home</label><input id="g-home" type="number" step="0.5" min="0" max="100">
       </div>
       <div class="row" style="margin-top:10px"><button id="gSave">Save gripper values</button></div>
+      <h2 style="margin-top:16px">Payload gripper and container</h2>
+      <div class="gv">
+        <label for="pg-open">Open (approach and release the container)</label><input id="pg-open" type="number" step="0.5" min="0" max="100">
+        <label for="pg-grip">Grip (close on the container)</label><input id="pg-grip" type="number" step="0.5" min="0" max="100">
+        <label for="pc-mass">Empty container mass (g)</label><input id="pc-mass" type="number" step="1" min="0" max="2000">
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="pgTryOpen" title="Teach mode: hold the gripper at the Open value">Try open</button>
+        <button id="pgTryGrip" title="Teach mode: hold the gripper at the Grip value">Try grip</button>
+        <button id="pgSave">Save</button>
+      </div>
+      <div style="color:var(--dim);font-size:12px;margin-top:6px">Try open / Try grip move the gripper now (teach mode only), so you can find the values with the container in the jaws. Save keeps them.</div>
       <h2 style="margin-top:16px">How to teach a cell</h2>
       <ol>
         <li>Put a block on the cell's dashed outline.</li>
@@ -131,6 +146,9 @@ const $ = id => document.getElementById(id);
 const JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
 const SLOTS = ['home'];
 for (let n = 1; n <= 9; n++) SLOTS.push(n + '.hover', n + '.grab');
+const PSLOTS = ['hover', 'grab', 'lift', 'left', 'right'];          // payload test, saved in payload_poses.json
+const PNAME = { hover: 'Hover', grab: 'Grab', lift: 'Lift (hold)', left: 'Left rotate', right: 'Right rotate' };
+for (const k of PSLOTS) SLOTS.push('payload.' + k);
 let cur = 0, poses = null, posesVersion = -1, state = null, online = false;
 
 async function api(path, body) {
@@ -141,12 +159,14 @@ async function api(path, body) {
 function say(m, err = false) { $('msg').textContent = m || ''; $('msg').classList.toggle('err', !!err); }
 function slotLabel(s) {
   if (s === 'home') return ['Home', ''];
+  if (s.startsWith('payload.')) return ['Payload', PNAME[s.slice(8)]];
   const [n, k] = s.split('.');
   return [`Cell ${n}`, k === 'hover' ? 'Hover' : 'Grab'];
 }
 function poseOf(s) {
   if (!poses) return null;
   if (s === 'home') return poses.home;
+  if (s.startsWith('payload.')) return poses.payload?.poses?.[s.slice(8)] || null;
   const [n, k] = s.split('.');
   return poses.cells?.[n]?.[k] || null;
 }
@@ -160,23 +180,30 @@ function buildCells() {
       `<div class="slot" data-slot="${n}.${k}"><span>${k === 'hover' ? 'Hover' : 'Grab'}</span><span class="tick" id="tick-${n}-${k}"></span></div>`).join('');
     box.appendChild(c);
   }
+  $('pslots').innerHTML = PSLOTS.map(k => `<div class="cell"><div class="slot" data-slot="payload.${k}" style="flex-direction:column;align-items:flex-start">`
+    + `<span>${PNAME[k]}</span><span class="tick" id="tick-payload-${k}"></span></div></div>`).join('');
   document.querySelectorAll('.slot').forEach(el => el.onclick = () => { cur = SLOTS.indexOf(el.dataset.slot); render(); });
 }
 const HOWTO = {
   home: 'The pose the robot starts from and returns to. Fold the arm into your demo rest pose, then Lock and save. (A default from your screenshot is used until you save one.)',
   hover: 'Open jaws centred above the block, high enough to carry a block over the others.',
   grab: 'Jaws around the block at the height you want to grip. The gripper stays at the teach value, do not move it.',
+  'payload.hover': 'Open jaws centred above the container in cell 2, high enough to clear it.',
+  'payload.grab': 'Jaws around the container at grip height. Use Try open first so the jaws fit around it. Also used to put it back.',
+  'payload.lift': 'The holding position: the robot must hold the loaded container here for 5 s. This pose decides how hard the test is.',
+  'payload.left': 'Turn the BASE to the left end of the dance. Only the base angle is used: the other joints are copied from Lift.',
+  'payload.right': 'Turn the BASE to the right end of the dance. Only the base angle is used: the other joints are copied from Lift.',
 };
 function render() {
   const s = SLOTS[cur];
   const [a, b] = slotLabel(s);
   $('slotname').innerHTML = a + (b ? `<small>${b}</small>` : '');
-  $('howto').textContent = s === 'home' ? HOWTO.home : HOWTO[s.split('.')[1]];
+  $('howto').textContent = s === 'home' ? HOWTO.home : s.startsWith('payload.') ? HOWTO[s] : HOWTO[s.split('.')[1]];
   document.querySelectorAll('.slot').forEach(el => el.classList.toggle('cur', el.dataset.slot === s));
   for (const sl of SLOTS) {
     const id = sl === 'home' ? 'tick-home' : `tick-${sl.replace('.', '-')}`;
     const el = $(id); if (!el) continue;
-    const t = poses?.taught?.[sl];
+    const t = sl.startsWith('payload.') ? poses?.payload?.taught?.[sl.slice(8)] : poses?.taught?.[sl];
     el.textContent = isTaught(sl) ? 'saved' + (t ? ' ' + t.slice(11, 16) : '') : (sl === 'home' ? 'default' : 'not yet');
     el.parentElement.classList.toggle('done', isTaught(sl));
   }
@@ -188,15 +215,26 @@ function render() {
   $('lockBtn').disabled = !teach || busy;
   $('lockOnly').disabled = !teach || !teach.free || busy;
   $('gotoBtn').disabled = !teach || teach.free || busy || !poseOf(s);
-  const n = s === 'home' ? null : s.split('.')[0];
-  $('testBtn').disabled = !teach || teach.free || busy || !n || !poseOf(n + '.hover') || !poseOf(n + '.grab');
-  $('testBtn').textContent = n ? `Test cell ${n}` : 'Test cell';
+  const pay = s.startsWith('payload.');
+  const n = s === 'home' || pay ? null : s.split('.')[0];
+  $('testBtn').disabled = !teach || teach.free || busy ||
+    (pay ? !PSLOTS.every(k => poseOf('payload.' + k)) : !n || !poseOf(n + '.hover') || !poseOf(n + '.grab'));
+  $('testBtn').textContent = pay ? 'Test payload path' : n ? `Test cell ${n}` : 'Test cell';
+  $('testBtn').title = pay ? 'hover, grab, hover, lift, left, right, lift, hover. Gripper untouched.' : '';
+  $('pgTryOpen').disabled = $('pgTryGrip').disabled = !teach || busy;
+  $('pnotes').textContent = (poses?.payload?.notes || []).join(' ');
   $('homeBtn').disabled = (teach && teach.free) || busy;
 }
 function fillGripper() {
   for (const k of ['teach', 'open', 'grip', 'home']) {
     const el = $('g-' + k); if (document.activeElement !== el) el.value = poses.gripper[k];
   }
+  const pg = poses.payload?.gripper;           // not set yet: start from the sorting values, unsaved
+  for (const k of ['open', 'grip']) {
+    const el = $('pg-' + k); if (document.activeElement !== el) el.value = pg ? pg[k] : poses.gripper[k];
+  }
+  const cm = $('pc-mass'); if (document.activeElement !== cm) cm.value = poses.payload?.container_g ?? '';
+  $('pgSave').textContent = pg ? 'Save' : 'Save (not saved yet)';
 }
 async function loadPoses() { const r = await api('/api/poses'); poses = r.data; posesVersion = poses.version; fillGripper(); render(); }
 
@@ -220,7 +258,22 @@ $('lockOnly').onclick = async () => { const r = await api('/api/teach/lock', {})
 $('prevBtn').onclick = () => { cur = Math.max(0, cur - 1); render(); };
 $('nextBtn').onclick = () => { cur = Math.min(SLOTS.length - 1, cur + 1); render(); };
 $('gotoBtn').onclick = async () => { const r = await api('/api/teach/goto', { slot: SLOTS[cur] }); say(r.data.msg, !r.ok); };
-$('testBtn').onclick = async () => { const r = await api('/api/teach/test_cell', { cell: +SLOTS[cur].split('.')[0] }); say(r.data.msg, !r.ok); };
+$('testBtn').onclick = async () => {
+  const r = SLOTS[cur].startsWith('payload.') ? await api('/api/payload/test_path', {})
+                                              : await api('/api/teach/test_cell', { cell: +SLOTS[cur].split('.')[0] });
+  say(r.data.msg, !r.ok);
+};
+$('pgTryOpen').onclick = async () => { const r = await api('/api/teach/hold', { value: +$('pg-open').value }); say(r.data.msg, !r.ok); };
+$('pgTryGrip').onclick = async () => { const r = await api('/api/teach/hold', { value: +$('pg-grip').value }); say(r.data.msg, !r.ok); };
+$('pgSave').onclick = async () => {
+  const r1 = await api('/api/payload/gripper', { open: +$('pg-open').value, grip: +$('pg-grip').value });
+  let msg = r1.data.msg, ok = r1.ok;
+  if ($('pc-mass').value !== '') {
+    const r2 = await api('/api/payload/container', { container_g: +$('pc-mass').value });
+    msg += ' ' + r2.data.msg; ok = ok && r2.ok;
+  }
+  say(msg, !ok); loadPoses();
+};
 $('homeBtn').onclick = async () => { const r = await api('/api/go_home', {}); say(r.data.msg, !r.ok); };
 $('stop').onclick = doStop;
 $('gSave').onclick = async () => {

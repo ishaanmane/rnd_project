@@ -164,7 +164,20 @@ The colours are worked out from the counts (3 = A, 2 = B, 1 = C). Demo set: 3 gr
 2 blue, 2 red. Green must be the colour with 3 blocks (`MAIN_COLOR` in sorting.py), so a misread
 board is refused before the robot moves. Cells 3, 5 and 9 end empty and
 serve as parking cells. Planner: `sorting.py` (`python sorting.py test` checks every claim on all
-5040 start layouts, about 2 minutes).
+5040 start layouts, about 4 minutes).
+
+Three planners can be chosen ("Planner" dropdown on the twin page, or the Greedy / BFS / Dijkstra
+row on the AR Sort screen). Changing it re-plans the board at once.
+
+- **Greedy (simple)**: move any block straight home, park one when stuck. Quick, sometimes 1-2
+  moves more than needed.
+- **BFS**: breadth-first search. Always the fewest moves.
+- **Dijkstra**: searches over (board, where the arm is) and counts robot seconds, worked out from
+  the taught poses and the current speed. Always the fastest plan for the real arm, sometimes with
+  one move more than BFS. Needs all 9 cells taught.
+
+Every plan shows its predicted robot time. When a sort finishes, the real time is shown next to it
+and added to `sort_runs.csv` (one line per run), so the planners can be compared on the robot.
 
 ### 1. Teach the poses (once, and again whenever the sheet or the robot moves)
 
@@ -246,9 +259,43 @@ The twin draws the sheet, the blocks and the plan arrows (bright = next move). T
 from the taught grab poses; the panel shows the fit error in mm. More than about 10 mm means the
 teaching or the twin calibration is off.
 
+## Payload experiment
+
+How much can the arm carry, and how does speed change the load on each motor? A 3D printed container
+(5 x 5 x 2.5 cm) sits in cell 2 with hammer heads inside: 0 to 500 g in 100 g steps.
+
+**Teach once** (teach page, "Payload test" row under the grid). These poses are saved in
+`payload_poses.json`, so the sorting poses are never touched. Home is shared with sorting.
+
+1. Hover, Grab (also used to put the container back), Lift (the holding position), Left rotate, Right rotate.
+   For Left/Right only the base angle counts: the other joints are copied from Lift.
+2. "Payload gripper and container": use Try open / Try grip with the container in the jaws to find
+   the values, enter the empty container's mass, then Save.
+3. Test payload path runs hover, grab, hover, lift, left, right, lift, hover with the gripper untouched.
+
+**Run** (2D page "Payload test" panel, or AR Homepage > Payload Testing): pick the weight and the
+speed (10, 20 or 30 °/s for every motor), press Run test. The robot does Home > hover > grab > close
+> hover > lift > **hold 5 s** > left > right > lift > hover > grab > open > hover > Home.
+
+- The hold PASSES when every arm joint stays within 5° of Lift, no servo reports overload and the
+  container does not slip. If it fails, the dance is skipped and the container is put back.
+- Before the run, the gravity model (`payload_model.py`) predicts the peak load per motor. Above
+  100 % of stall, Run asks for a second press.
+- Motors are coloured by load: green below 50 %, orange below 80 %, red above, flashing on overload.
+  With the robot the numbers are the servos' own readings (load, current, temperature), with the
+  model beside them. With `--sim` there are no readings, so the twin shows the model.
+- **RELEASE** (big red button, or R on the 2D page) stops the test, freezes the arm where it is
+  and opens the gripper at once: the container drops. Keep something soft under the Lift pose.
+
+Every run writes `payload_runs/<time>_<mass>g_<speed>dps.csv` (every control tick) and one line in
+`payload_runs/summary.csv` (result, hold error, slip, servo flags, peak and mean load per motor, the
+model's prediction, peak current, base load during the dance, temperature).
+
 ## Safety notes
 
 - First runs: lower the max speed (10 to 20 °/s) and keep a hand on STOP.
+- Payload test: start with the empty container at 10 °/s, keep a hand near RELEASE, and stand
+  clear of the space under the Lift pose.
 - The open value (19.5 %) leaves little room around a 25 mm block. If the jaws push blocks
   while lowering, raise "Open" on the teach page. No re-teaching is needed.
 - The server binds to 127.0.0.1 only. `--host 0.0.0.0` lets anyone on the network move the arm.

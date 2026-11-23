@@ -57,6 +57,19 @@
   body.aligning .joint input[type=range] { opacity: .35; pointer-events: none; }
   body.aligning #legend::after { content: "ALIGN MODE — motors locked"; display: block; color: var(--target); font-weight: 700; margin-top: 4px; }
   .note { color: var(--dim); font-size: 11.5px; margin-top: 8px; }
+  .seg button { flex: 1; padding: 5px 0; font-size: 12px; }
+  .seg button.on { background: #ff9f1a; border-color: #ff9f1a; color: #111; font-weight: 700; }
+  .seg .lab { color: var(--dim); font-size: 11px; width: 52px; flex: 0 0 52px; }
+  button.release { width: 100%; margin-top: 8px; padding: 14px 10px; font-size: 16px; font-weight: 800; letter-spacing: .5px;
+    background: var(--danger); border: 2px solid #ff8a8d; color: #fff; }
+  button.release:hover { background: #ff2d55; }
+  #payHold { margin-top: 8px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #payWarn { margin-top: 6px; color: #ff2d55; font-weight: 700; }
+  #payTable { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  #payTable th { color: var(--dim); font-weight: 500; text-align: right; padding: 2px 4px; }
+  #payTable th:first-child, #payTable td:first-child { text-align: left; }
+  #payTable td { text-align: right; padding: 2px 4px; }
+  #payTable .bar { display: inline-block; height: 8px; border-radius: 3px; vertical-align: middle; margin-right: 6px; }
 
   #replayBar { background: var(--panel2); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
   .rhead { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
@@ -194,6 +207,14 @@
     <div class="robotside">ROBOT SIDE</div>
     <div class="note" style="margin-top:0">Click a cell to change its block: empty, green, yellow, blue, red. Use 3 green + 2 of one colour + 1 of another.</div>
     <div class="row" style="margin-top:8px">
+      <label for="sortAlg" style="color:var(--dim);font-size:12px">Planner</label>
+      <select id="sortAlg" title="Greedy: quick rule of thumb. BFS: fewest moves. Dijkstra: fewest robot seconds.">
+        <option value="greedy_simple">Greedy (simple)</option>
+        <option value="bfs">BFS (fewest moves)</option>
+        <option value="dijkstra">Dijkstra (fastest robot time)</option>
+      </select>
+    </div>
+    <div class="row" style="margin-top:6px">
       <button id="sortPlan" style="flex:1">Plan</button>
       <button id="sortRun" class="primary" style="flex:1">Run</button>
     </div>
@@ -212,6 +233,24 @@
     <div id="sortStep"></div>
     <ol id="sortList"></ol>
     <div class="note" id="gridFit"></div>
+
+    <h2>Payload test</h2>
+    <div class="note" id="paySrc" style="margin-top:0"></div>
+    <div class="row seg" id="payMass" style="margin-top:6px"></div>
+    <div class="row seg" id="paySpeed" style="margin-top:6px"></div>
+    <div class="note" id="payPre"></div>
+    <div class="row" style="margin-top:6px">
+      <button id="payRun" class="primary" style="flex:2">Run test</button>
+      <button id="payHome" style="flex:1">Go Home</button>
+      <a href="/teach" style="flex:1"><button style="width:100%">Teach…</button></a>
+    </div>
+    <button id="payRelease" class="release" title="Stop, freeze the arm, open the gripper at once (R)">RELEASE: open gripper now</button>
+    <div id="payHold"></div>
+    <div id="payWarn"></div>
+    <table id="payTable"></table>
+    <label class="note" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="payColor" checked>
+      Colour the twin's motors by load (green &lt; 50 %, orange &lt; 80 %, red above, flashing = overload or over 100 %)</label>
+    <div class="note" id="payMsg"></div>
 
     <h2>Twin ↔ real arm alignment</h2>
     <button id="alignBtn" style="width:100%">Align twin to real arm…</button>
@@ -249,6 +288,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import URDFLoader from 'urdf-loader';
 import { PointerURDFDragControls } from 'urdf-drag';
 import { initSorting } from '/board.js';
+import { initPayload } from '/payload.js';
 import { cameraSupported, allowCamera, cameraPermission, captureJPEG, listCameras,
          preferredCamera, setPreferredCamera, shortName, isRoomCamera, HEADSET_CAMERAS_FIX } from '/questcam.js';
 
@@ -550,6 +590,9 @@ function buildPanel() {
     if (e.code === 'Space' && !(e.target instanceof HTMLInputElement && e.target.type === 'text')) {
       e.preventDefault(); doStop();
     }
+    if (e.code === 'KeyR' && !e.repeat && !e.ctrlKey && !e.metaKey && !(e.target instanceof HTMLInputElement)) {
+      e.preventDefault(); $('payRelease')?.click();        // payload SAFETY CUTOFF
+    }
   });
 }
 async function doStop() {
@@ -709,6 +752,11 @@ async function poll() {
     document.body.classList.toggle('busy', !!state.program?.active);
     document.body.classList.toggle('armfree', !!state.teach?.free);
     if (sortingUI) sortingUI.update(state);
+    if (payloadUI) payloadUI.update(state);
+    if (!renderer.xr.isPresenting) {               // desktop: colour the twin's servos by load
+      const on = !!payloadUI?.colourOn();
+      for (const j of JOINTS) { if (on) paintLoad(j, now); else paintServo(j, null); }
+    }
     const rb = $('rec');
     rb.classList.toggle('on', state.recording);
     rb.textContent = state.recording ? 'Stop recording' : 'Record';
@@ -718,12 +766,14 @@ async function poll() {
   setTimeout(poll, 50);
 }
 
-let sortingUI = null;
+let sortingUI = null, payloadUI = null;
 async function maybeStart() {
   if (!actualBot || !cfg) return;
   sortingUI = initSorting({ THREE, twinRoot, actualBot, toRad, api, say, renderer, cfg,
                            showInAR: () => ar.screen === 'sort' });
   window.twin.sorting = sortingUI;   // handy in the devtools console
+  payloadUI = initPayload({ api, say, cfg, levelOf: loadLevel, valueOf: loadValue, hex: LOAD_HEX });
+  window.twin.payload = payloadUI;
   for (const j of JOINTS) {
     ghostJ[j].setJointValue(toRad(j, target[j]));
     actualJ[j].setJointValue(toRad(j, target[j]));
@@ -817,6 +867,8 @@ const ar = {
   screen: 'home',                     // AR menu screen: 'home' (Sort / Settings), 'settings', 'sort'
   openOnStart: false,                 // show the homepage on the first AR frame
   holoBeforeSort: null,               // hologram state to restore when leaving the Sort screen
+  holoBeforePay: null,                // same for the Payload screen (which forces the hologram on)
+  pay: { mass: 0, speed: 20, confirm: false, pre: null },   // Payload screen choices
   scanBusy: false, camNote: '',       // Scan with the Quest camera
   shot: null,                         // a photo waiting for "Use this photo" / "Click again"
   camError: null,                     // {short, fix} when the camera cannot give a usable picture
@@ -857,7 +909,7 @@ function findLiftMotor() {
   }
   if (!best || bestD > 0.002) { console.warn(`[AR] ${ALIGN_MOTOR.name} motor mesh not found`); return null; }
   const meshes = [];
-  best.traverse(o => { if (o.isMesh) meshes.push({ mesh: o, mat: o.material }); });
+  best.traverse(o => { if (o.isMesh) meshes.push({ mesh: o, mat: origMat(o) }); });
   liftMotor = { visual: best, meshes };
   return liftMotor;
 }
@@ -1597,14 +1649,19 @@ async function loadRecordings() {
 }
 // Game-style menu with three screens. Homepage: Sort / Settings. Settings: the AR menu below.
 // Sort: the sorting demo. Only one screen panel is visible at a time; switching keeps its place.
-const HOME_W = 0.30, HOME_H = 0.16;
+const HOME_W = 0.40, HOME_H = 0.16;
 const homePanel = new ARPanel(HOME_W, HOME_H, { px: 3000 });
 panels.push(homePanel);
-const SORT_W = 0.38, SORT_H = 0.34;          // room for 9 moves, the most Greedy (simple) ever needs
+const SORT_W = 0.38, SORT_H = 0.372;         // planner row + room for 9 moves, the most any planner needs
 const sortPanel = new ARPanel(SORT_W, SORT_H, { px: 3000 });
 panels.push(sortPanel);
-const menuPanels = () => [homePanel, arMenu, sortPanel];
-function screenPanel(s = ar.screen) { return s === 'settings' ? arMenu : s === 'sort' ? sortPanel : homePanel; }
+const PAY_W = 0.40, PAY_H = 0.418;           // Payload Testing screen
+const payloadPanel = new ARPanel(PAY_W, PAY_H, { px: 3000 });
+panels.push(payloadPanel);
+const menuPanels = () => [homePanel, arMenu, sortPanel, payloadPanel];
+function screenPanel(s = ar.screen) {
+  return s === 'settings' ? arMenu : s === 'sort' ? sortPanel : s === 'payload' ? payloadPanel : homePanel;
+}
 
 // ---- moving a menu: the bar under it, like a browser window's bar -------------------------------
 // Pinch the bar (or point at it and hold the trigger / pinch), move, let go. The menu turns to face
@@ -1631,7 +1688,7 @@ function drawBar(bar, state) {
   g.beginPath(); g.roundRect(W * 0.2, H * 0.32, W * 0.6, H * 0.36, H * 0.18); g.fill();
   bar.userData.tex.needsUpdate = true;
 }
-[homePanel, arMenu, sortPanel].forEach(makeMoveBar);
+[homePanel, arMenu, sortPanel, payloadPanel].forEach(makeMoveBar);
 
 function barUnder(point) {                         // the visible move bar this point is pinching, if any
   if (!point) return null;
@@ -1717,14 +1774,28 @@ function leaveSort() {
   ar.holoBeforeSort = null;
   sortingUI?.refreshVisibility();
 }
+function enterPayload() {                                   // hologram ON: its servos show the load
+  ar.holoBeforePay = ar.holo;
+  if (!ar.holo) { ar.holo = true; applyLook(); }
+  ar.pay.confirm = false;
+  payPrecheck();
+}
+function leavePayload() {
+  if (ar.holoBeforePay != null && ar.holo !== ar.holoBeforePay) { ar.holo = ar.holoBeforePay; applyLook(); }
+  ar.holoBeforePay = null;
+  for (const j of JOINTS) paintServo(j, null);
+}
 function goScreen(s) {
   const old = screenPanel().mesh, wasOpen = old.visible;
   const pos = old.position.clone(), quat = old.quaternion.clone();
   for (const p of menuPanels()) p.mesh.visible = false;
   if (ar.screen === 'sort' && s !== 'sort') leaveSort();
+  if (ar.screen === 'payload' && s !== 'payload') leavePayload();
   const entering = ar.screen !== 'sort' && s === 'sort';
+  const enteringPay = ar.screen !== 'payload' && s === 'payload';
   ar.screen = s; ar.confirm.id = null; ar.note = '';
   if (entering) enterSort();
+  if (enteringPay) enterPayload();
   if (!wasOpen) return openMenu();
   const m = screenPanel().mesh;
   m.position.copy(pos); m.quaternion.copy(quat); m.visible = true; ar.menuOpen = true;
@@ -1734,14 +1805,96 @@ function goScreen(s) {
 function homeItems() {
   const I = [];
   I.push({ t: 'SO-101 Digital Twin', x: 0.015, y: 0.022, size: 0.014, b: true });
-  I.push({ btn: true, id: 'goSort', label: 'Sort', x: 0.015, y: 0.04, w: 0.13, h: 0.078, size: 0.022 });
-  I.push({ btn: true, id: 'goSettings', label: 'Settings', x: 0.155, y: 0.04, w: 0.13, h: 0.078, size: 0.022 });
+  I.push({ btn: true, id: 'goSort', label: 'Sort', x: 0.015, y: 0.04, w: 0.118, h: 0.078, size: 0.022 });
+  I.push({ btn: true, id: 'goPayload', label: 'Payload Testing', x: 0.141, y: 0.04, w: 0.118, h: 0.078, size: 0.0155 });
+  I.push({ btn: true, id: 'goSettings', label: 'Settings', x: 0.267, y: 0.04, w: 0.118, h: 0.078, size: 0.022 });
   const st = ar.note || (!ar.aligned ? 'Not aligned yet: open Settings and align first.'
                                      : 'Y opens and closes this menu. Pinch the bar below it to move it.');
   I.push({ t: st, x: 0.015, y: 0.14, size: 0.0095, c: ar.aligned || ar.note ? '#8a8d99' : '#ff9f1a' });
   return I;
 }
 
+// ---- Payload Testing screen --------------------------------------------------------------
+const PAY_MASSES = [0, 100, 200, 300, 400, 500], PAY_SPEEDS = [10, 20, 30];
+const PAY_JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+async function payPrecheck() {
+  const r = await api('/api/payload/precheck', { mass_g: ar.pay.mass });
+  ar.pay.pre = r.ok ? r.data.precheck : null;
+  ar.pay.preText = r.data?.msg || '';
+}
+for (const m of PAY_MASSES) actions['pay_m' + m] = () => { ar.pay.mass = m; ar.pay.confirm = false; payPrecheck(); };
+for (const v of PAY_SPEEDS) actions['pay_s' + v] = () => { ar.pay.speed = v; };
+const fmtJ = j => j.replace('shoulder_', 'shoulder ').replace('_flex', ' flex').replace('_roll', ' roll');
+function payItems() {
+  const I = [], pl = state?.payload || {}, prog = state?.program, L = state?.loads;
+  const running = !!prog?.active, payRunning = running && pl.status === 'running';
+  I.push({ t: 'Payload test', x: 0.015, y: 0.021, size: 0.014, b: true, maxW: 0.14 });
+  I.push({ t: L?.source === 'real' ? 'live servo readings' : 'model (no robot readings)', x: 0.16, y: 0.021, size: 0.0095,
+           c: L?.source === 'real' ? '#3ecf8e' : '#4aa3ff', maxW: 0.14 });
+  I.push({ btn: true, id: 'homepage', label: 'Homepage', x: PAY_W - 0.087, y: 0.006, w: 0.077, h: 0.028, size: 0.0105 });
+  // choices
+  I.push({ t: 'Payload', x: 0.015, y: 0.056, size: 0.0105, c: '#8a8d99' });
+  PAY_MASSES.forEach((m, i) => I.push({ btn: true, id: 'pay_m' + m, label: m ? m + ' g' : 'empty', x: 0.075 + i * 0.052,
+    y: 0.043, w: 0.049, h: 0.026, size: 0.0105, on: ar.pay.mass === m, disabled: running }));
+  I.push({ t: 'Speed', x: 0.015, y: 0.089, size: 0.0105, c: '#8a8d99' });
+  PAY_SPEEDS.forEach((v, i) => I.push({ btn: true, id: 'pay_s' + v, label: v + ' °/s', x: 0.075 + i * 0.075,
+    y: 0.076, w: 0.07, h: 0.026, size: 0.0105, on: ar.pay.speed === v, disabled: running }));
+  // actions
+  I.push({ btn: true, id: 'payRun', label: ar.pay.confirm ? 'Confirm: run anyway' : 'Run test', x: 0.015, y: 0.112, w: 0.16, h: 0.038,
+           size: 0.0145, on: !ar.pay.confirm, danger: ar.pay.confirm, disabled: running });
+  I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.182, y: 0.112, w: 0.09, h: 0.038, danger: true });
+  I.push({ btn: true, id: 'armHome', label: 'Arm Home', x: 0.279, y: 0.112, w: 0.106, h: 0.038, size: 0.0125, disabled: running });
+  // SAFETY CUTOFF: always enabled, never needs a second press
+  I.push({ btn: true, id: 'payRelease', label: 'RELEASE  (open gripper now)', x: 0.015, y: 0.158, w: 0.37, h: 0.05,
+           size: 0.018, danger: true });
+  // status: prediction before a run, then the hold, then the result
+  const pre = ar.pay.pre;
+  let line1 = ar.note || '', c1 = /^RELEASED/.test(ar.note || '') ? '#ff9f1a' : '#8a8d99';
+  if (!line1) {
+    if (payRunning) { line1 = `${pl.mass_g} g at ${pl.speed} °/s · ${prog.label} (${prog.step}/${prog.count})`; c1 = '#4aa3ff'; }
+    else if (pl.msg && pl.status !== 'running' && pl.status !== 'idle') { line1 = pl.msg; c1 = pl.result === 'PASS' ? '#3ecf8e' : '#ff9f1a'; }
+    else if (ar.pay.preText) { line1 = ar.pay.preText; c1 = pre?.level === 'over' ? '#ff2d55' : pre?.level === 'high' ? '#e5484d' : pre?.level === 'warn' ? '#ff7a1a' : '#8a8d99'; }
+  }
+  I.push({ t: line1, x: 0.015, y: 0.224, size: 0.0095, c: c1 });
+  const h = pl.hold;
+  if (h) {
+    const res = h.result ? `HOLD ${h.result}` : `HOLD ${h.t.toFixed(1)} / ${h.s.toFixed(0)} s`;
+    I.push({ t: `${res}   max error ${h.max_err.toFixed(1)}° (${fmtJ(h.joint)}, limit ${h.tol}°)${h.slip ? '   SLIPPED' : ''}`,
+             x: 0.015, y: 0.246, size: 0.0118, b: true, c: h.result === 'PASS' ? '#3ecf8e' : h.result === 'FAIL' ? '#e5484d' : '#4aa3ff' });
+  }
+  // live warning
+  const hot = PAY_JOINTS.filter(j => ['high', 'flag'].includes(loadLevel(j, L)));
+  if (hot.length) {
+    const j = hot[0], f = L.flags?.[j];
+    I.push({ t: f?.length ? `${fmtJ(j)} reports ${f.join(', ')}: press RELEASE` : `${fmtJ(j)} at ${loadValue(j, L).toFixed(0)} %: RELEASE if it keeps rising`,
+             x: 0.015, y: 0.268, size: 0.011, b: true, c: '#ff2d55' });
+  }
+  // table: joint | load | model | temp
+  const real = L?.source === 'real';
+  const cols = [0.015, 0.15, 0.235, 0.32];
+  ['motor', real ? 'load' : 'model', real ? 'model' : '', real ? 'temp' : ''].forEach((t, i) =>
+    I.push({ t, x: cols[i], y: 0.29, size: 0.0095, c: '#8a8d99' }));
+  PAY_JOINTS.forEach((j, i) => {
+    const y = 0.309 + i * 0.0155, lv = loadLevel(j, L), v = loadValue(j, L), pv = L?.pred?.[j];
+    I.push({ t: fmtJ(j), x: cols[0], y, size: 0.0105 });
+    I.push({ t: v == null ? '–' : v.toFixed(0) + ' %', x: cols[1], y, size: 0.0105, b: true, c: LOAD_HEX[lv] || '#8a8d99' });
+    if (real) {
+      I.push({ t: pv == null ? '–' : pv.toFixed(0) + ' %', x: cols[2], y, size: 0.0105, c: '#8a8d99' });
+      const tc = L.temp?.[j];
+      I.push({ t: tc == null ? '–' : tc.toFixed(0) + ' °C', x: cols[3], y, size: 0.0105, c: tc >= 60 ? '#e5484d' : '#8a8d99' });
+    }
+  });
+  if (L?.source !== 'real')
+    I.push({ t: 'shoulder pan: no gravity load on the base (vertical axis), its load is speed and friction',
+             x: 0.015, y: PAY_H - 0.009, size: 0.0082, c: '#6b6e78' });
+  return I;
+}
+
+const PLANNERS = [['greedy_simple', 'Greedy'], ['bfs', 'BFS'], ['dijkstra', 'Dijkstra']];
+async function choosePlanner(alg) {
+  const r = await api('/api/sort/algorithm', { algorithm: alg });
+  ar.note = r.data?.msg || (r.ok ? '' : 'Could not change the planner');
+}
 const KIND_NAME = { home: 'home', home_frees: 'home, frees a cell', park: 'park (loop)' };
 const KIND_HEX = { home: '#3ecf8e', home_frees: '#4fd1c5', park: '#f0b54a' };
 function sortItems() {
@@ -1763,27 +1916,33 @@ function sortItems() {
     I.push({ btn: true, id: 'stop', label: 'STOP', x: 0.195, y: 0.045, w: 0.085, h: 0.04, danger: true });
     I.push({ btn: true, id: 'armHome', label: 'Arm Home', x: 0.285, y: 0.045, w: 0.08, h: 0.04, size: 0.0125, disabled: running });
   }
+  // planner choice: the lit one is in use. Pressing another re-plans the board at once.
+  I.push({ t: 'Planner', x: 0.015, y: 0.105, size: 0.0105, c: '#8a8d99', maxW: 0.058 });
+  PLANNERS.forEach(([alg, label], i) => {
+    I.push({ btn: true, id: 'alg_' + alg, label, x: 0.075 + i * 0.1, y: 0.092, w: 0.095, h: 0.026, size: 0.0105,
+             on: state?.sort_algorithm === alg, disabled: running || busy || !!ar.shot });
+  });
   // status: scan result, camera info, what the robot is doing
   const scanLine = ar.camError ? ar.camError.short
                  : ar.shot ? 'Check the photo: the whole sheet, all 4 corner markers and every block visible?'
                  : ar.scanBusy ? (ar.camNote || 'Taking a picture...') : sc?.busy ? 'Finding the blocks...' : (sc?.msg || ar.note ||
                    (ar.aligned ? 'Arm at Home, look down at the whole sheet, press Take picture.' : 'Not aligned: Homepage > Settings > Align.'));
-  I.push({ t: scanLine, x: 0.015, y: 0.103, size: 0.0098,
+  I.push({ t: scanLine, x: 0.015, y: 0.135, size: 0.0098,
            c: ar.camError ? '#ff9f1a' : ar.shot || busy ? '#4aa3ff' : sc ? (sc.ok ? '#3ecf8e' : '#ff9f1a') : '#8a8d99' });
-  if (ar.camError) I.push({ t: ar.camError.fix, x: 0.015, y: 0.122, size: 0.0085, c: '#e8e8e8' });
-  else if (ar.camNote && !ar.scanBusy) I.push({ t: ar.camNote, x: 0.015, y: 0.122, size: 0.0085, c: '#8a8d99' });
+  if (ar.camError) I.push({ t: ar.camError.fix, x: 0.015, y: 0.154, size: 0.0085, c: '#e8e8e8' });
+  else if (ar.camNote && !ar.scanBusy) I.push({ t: ar.camNote, x: 0.015, y: 0.154, size: 0.0085, c: '#8a8d99' });
   let doing = '';
   if (running) doing = `${prog.label}  (${prog.step}/${prog.count})`;
   else if (sort?.moves?.length) doing = sort.done >= sort.moves.length ? (prog?.msg || 'Sorted.')
                                       : (sc?.ok ? '' : `${sort.summary.short} Press Run.`);   // a good scan already says it
   else if (prog?.msg) doing = prog.msg;
-  I.push({ t: doing, x: 0.015, y: 0.143, size: 0.0105, b: true, c: '#4aa3ff' });
+  I.push({ t: doing, x: 0.015, y: 0.175, size: 0.0105, b: true, c: '#4aa3ff' });
   // the plan, one line per move
   const moves = sort?.moves || [];
   moves.slice(0, 9).forEach((m, i) => {
     const cur = running && m.n === sort.current;          // the move the robot is doing right now
     const done = m.n <= sort.done && !cur;
-    const y = 0.168 + i * 0.019;
+    const y = 0.2 + i * 0.019;
     I.push({ t: `${m.n}.  ${m.color}  ${m.src} \u2192 ${m.dst}`, x: 0.02, y, size: 0.0105, b: cur,
              c: done ? '#6b6e78' : cur ? '#4aa3ff' : '#e8e8e8', maxW: 0.17 });
     I.push({ t: done ? 'done' : KIND_NAME[m.kind] || m.kind, x: 0.2, y, size: 0.0095,
@@ -1925,12 +2084,22 @@ function menuItems(now) {
 Object.assign(actions, {
   close: closeMenu,
   homepage: () => goScreen('home'),
+  goPayload: () => goScreen('payload'),
+  payRun: async () => {
+    const r = await api('/api/payload/run', { mass_g: ar.pay.mass, speed: ar.pay.speed, confirm: ar.pay.confirm });
+    ar.pay.confirm = !!r.data?.confirm;                 // over 100 %: the next press confirms
+    ar.note = r.ok ? '' : (r.data.msg || 'Could not start');
+  },
+  payRelease: async () => { const r = await api('/api/payload/release', {}); ar.note = r.data?.msg || 'RELEASE sent'; },
   goSort: () => goScreen('sort'),
   goSettings: () => goScreen('settings'),
   scan: takePicture,
   usePhoto,
   again: takePicture,
   camera: cycleCamera,
+  alg_greedy_simple: () => choosePlanner('greedy_simple'),
+  alg_bfs: () => choosePlanner('bfs'),
+  alg_dijkstra: () => choosePlanner('dijkstra'),
   run: async () => { const r = await api('/api/sort/run', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not start'); },
   armHome: async () => { const r = await api('/api/go_home', {}); ar.note = r.ok ? '' : (r.data.msg || 'Could not move'); },
   menu: () => (ar.menuOpen ? closeMenu() : openMenu()),
@@ -2009,7 +2178,7 @@ function buildOverlays() {
   for (const j of JOINTS) {
     const v = servoVisual(j);
     const meshes = [];
-    v?.traverse(o => { if (o.isMesh) meshes.push({ mesh: o, mat: o.material }); });
+    v?.traverse(o => { if (o.isMesh) meshes.push({ mesh: o, mat: origMat(o) }); });
     const label = makeTextPanel(0.085, 0.036, 2400);
     label.visible = false;
     const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
@@ -2030,11 +2199,56 @@ function buildOverlays() {
 }
 function setMotorGlow(j, on) {
   const o = overlay[j];
-  if (!o || o.glowing === on) return;
+  if (!o) return;
   o.glowing = on;
-  for (const e of o.motor.meshes) e.mesh.material = on ? activeMat : e.mat;
+  paintServo(j, on ? activeMat : null);
 }
 function clearMotorGlows() { for (const j of JOINTS) setMotorGlow(j, false); }
+
+// ---- payload test: colour each servo by its LOAD -----------------------------------------
+// Real robot: the servo's own Present_Load (% of full drive). No robot (--sim): the static gravity
+// model from the server (% of the 30 kg·cm stall torque). Green < 50 %, orange < 80 %, red above,
+// flashing when a servo reports overload / overcurrent or the model says it cannot hold (>= 100 %).
+// Every recolouring (moving glow, align glow, load) goes through paintServo and restores the mesh's
+// own material, kept once on the mesh, so they never overwrite each other's "original".
+const LOAD_HEX = { ok: '#3ecf8e', warn: '#ff7a1a', high: '#e5484d', flag: '#ff2d55' };   // not amber: the arm is yellow
+const loadMats = {
+  ok: new THREE.MeshStandardMaterial({ color: 0x3ecf8e, emissive: 0x0f5a36, roughness: 0.45 }),
+  warn: new THREE.MeshStandardMaterial({ color: 0xff5a00, emissive: 0x7a2200, roughness: 0.45 }),
+  high: new THREE.MeshStandardMaterial({ color: 0xe5484d, emissive: 0x7a1416, roughness: 0.45 }),
+  flag: new THREE.MeshStandardMaterial({ color: 0xff2d55, emissive: 0xff0022, roughness: 0.3 }),
+};
+function origMat(o) { return o.userData.origMat || (o.userData.origMat = o.material); }
+const servoPaint = {};                   // joint -> { meshes, cur }
+function paintServo(j, mat) {
+  let s = servoPaint[j];
+  if (!s) {
+    const v = servoVisual(j);
+    if (!v) return;
+    const meshes = [];
+    v.traverse(o => { if (o.isMesh) { origMat(o); meshes.push(o); } });
+    s = servoPaint[j] = { meshes, cur: null };
+  }
+  if (s.cur === mat) return;
+  s.cur = mat;
+  for (const o of s.meshes) o.material = mat || o.userData.origMat;
+}
+function loadValue(j, L = state?.loads) {
+  if (!L) return null;
+  const v = L.source === 'real' ? L.load?.[j] : L.pred?.[j];
+  return v == null ? null : v;
+}
+function loadLevel(j, L = state?.loads) {
+  const v = loadValue(j, L);
+  if (v == null) return null;
+  if (L.flags?.[j]?.length || v >= 100) return 'flag';
+  return v >= L.high ? 'high' : v >= L.warn ? 'warn' : 'ok';
+}
+function paintLoad(j, now) {
+  const lv = loadLevel(j);
+  const off = lv === 'flag' && Math.floor(now / 250) % 2;      // flash
+  paintServo(j, !lv || off ? null : loadMats[lv]);
+}
 function hideOverlays() {
   for (const j of JOINTS) { const o = overlay[j]; if (!o) continue; o.label.visible = o.line.visible = o.arc.visible = false; }
   clearMotorGlows();
@@ -2081,8 +2295,9 @@ function updateOverlays(head, now) {
   for (const j of JOINTS) {
     const o = overlay[j], m = motion[j];
     const recent = m.active || now - m.endAt < SHOW_AFTER_MS;
-    // glow the servo that is moving (not while the align motor is glowing cyan)
-    setMotorGlow(j, m.active && ar.mode !== 'grab');
+    // glow the servo that is moving (not while the align motor is glowing cyan).
+    // On the Payload screen the colour shows each motor's LOAD instead.
+    if (ar.screen === 'payload' && ar.mode !== 'grab') paintLoad(j, now); else setMotorGlow(j, m.active && ar.mode !== 'grab');
     const show = mode === 'all' || (mode === 'moving only' && recent);
     o.label.visible = o.line.visible = show;
     o.arc.visible = recent && mode !== 'off' && Math.abs(m.delta) > 0.5;
@@ -2106,7 +2321,11 @@ function updateOverlays(head, now) {
       const u = UNIT(j), ang = state.actual[j];
       const lines = [{ t: j.replace('_', ' '), b: true, c: m.active ? '#ff9f1a' : '#e8e8e8' },
                      { t: `${ang >= 0 ? ' ' : ''}${ang.toFixed(1)}${u}`, b: true }];
-      if (recent) lines.push({ t: `${m.active ? 'Δ' : 'moved'} ${m.delta >= 0 ? '+' : ''}${m.delta.toFixed(1)}${u}` +
+      if (ar.screen === 'payload') {                   // live load on the motor itself
+        const v = loadValue(j), lv = loadLevel(j);
+        if (v != null) lines.push({ t: `load ${v.toFixed(0)} %${state.loads?.source === 'model' ? ' (model)' : ''}`, b: true,
+                                    c: LOAD_HEX[lv] || '#8a8d99' });
+      } else if (recent) lines.push({ t: `${m.active ? 'Δ' : 'moved'} ${m.delta >= 0 ? '+' : ''}${m.delta.toFixed(1)}${u}` +
                                   (m.active && m.speed >= MOVE_OFF ? `  ${m.speed.toFixed(0)}${u}/s` : ''), c: m.active ? '#ff9f1a' : '#8a8d99' });
       o.label.userData.draw(lines, m.active ? 'rgba(40,24,6,0.88)' : 'rgba(22,23,28,0.78)');
     }
@@ -2216,7 +2435,8 @@ function arFrame(frame, dt) {
   updateWristBar(head);
   if (ar.openOnStart && head.position.lengthSq() > 0 && !ar.restoring) { ar.openOnStart = false; openMenu(); }
   updatePanelDrag(head);
-  if (ar.menuOpen) screenPanel().set(ar.screen === 'settings' ? menuItems(now) : ar.screen === 'sort' ? sortItems() : homeItems());
+  if (ar.menuOpen) screenPanel().set(ar.screen === 'settings' ? menuItems(now) : ar.screen === 'sort' ? sortItems()
+                                    : ar.screen === 'payload' ? payItems() : homeItems());
   sortingUI?.arFrame(head);
   updatePanels(now);
   updatePointer();
@@ -2305,7 +2525,7 @@ renderer.xr.addEventListener('sessionstart', () => {
                       tuning: false, quality: '', note: '', placeOnNextFrame: true,
                       tuneMode: false, drag: null, poke: { armed: false, until: 0 }, persisted: false,
                       editing: false, editBackup: null, menuOpen: false, confirm: { id: null, until: 0 },
-                      screen: 'home', openOnStart: true, holoBeforeSort: null, scanBusy: false, camNote: '',
+                      screen: 'home', openOnStart: true, holoBeforeSort: null, holoBeforePay: null, scanBusy: false, camNote: '',
                       panelDrag: null, shot: null });
   try { const saved = store.get('so101-twin-menu'); ar.menuSpot = saved ? { frame: 'robot', p: JSON.parse(saved) } : null; }
   catch { ar.menuSpot = null; }
@@ -2325,6 +2545,7 @@ renderer.xr.addEventListener('sessionend', () => {
   grid.visible = true;
   hud.visible = false; wristBar.mesh.visible = false; pointerDot.visible = false; dwellRing.visible = false;
   if (ar.screen === 'sort') leaveSort();
+  if (ar.screen === 'payload') leavePayload();
   for (const p of menuPanels()) p.mesh.visible = false;
   ar.screen = 'home'; ar.panelDrag = null;
   ar.editing = false; ar.editBackup = null; ar.menuOpen = false;

@@ -1,0 +1,2 @@
+time,algorithm,start_board,moves,min_moves,predicted_s,measured_s,speed_deg_s,worst_pose_err_deg
+2026-11-23 11:42:08,dijkstra,YG.B.GYG.,7,7,70.0,74.5,30,3.3
